@@ -15,13 +15,24 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 
-def read_hdf5_data(file_path: str | Path) -> tuple[dict[str, Any], list[str]]:
+def read_hdf5_data(
+    file_path: str | Path,
+    skip_errors: bool = True,
+    libver: str | None = None
+) -> tuple[dict[str, Any], list[str]]:
     """
     Read an HDF5 file and return the data and keys.
     
     Parameters
     ----------
     file_path : str or Path
+        Path to the HDF5 file.
+    skip_errors : bool, default=True
+        If True, skip datasets that cannot be read and continue with others.
+        If False, raise an error when a dataset cannot be read.
+    libver : str, optional
+        HDF5 library version compatibility. Options: 'earliest', 'latest', 'v108', 'v110', 'v112'.
+        If None, uses default. Try 'latest' if encountering read errors.
     
     Returns
     -------
@@ -40,15 +51,292 @@ def read_hdf5_data(file_path: str | Path) -> tuple[dict[str, Any], list[str]]:
     
     data = {}
     keys = []
+    failed_datasets = []
     
-    with h5py.File(file_path, 'r') as f:
+    # Try different file opening strategies
+    file_kwargs = {}
+    if libver is not None:
+        file_kwargs['libver'] = libver
+    
+    # Try opening with different strategies
+    f = None
+    strategies = [
+        {'mode': 'r', **file_kwargs},
+        {'mode': 'r', 'libver': 'latest', **{k: v for k, v in file_kwargs.items() if k != 'libver'}},
+        {'mode': 'r', 'libver': 'earliest', **{k: v for k, v in file_kwargs.items() if k != 'libver'}},
+        {'mode': 'r', 'swmr': True, **file_kwargs},  # Single Writer Multiple Reader mode
+    ]
+    
+    for strategy in strategies:
+        try:
+            f = h5py.File(file_path, **strategy)
+            # Test if we can actually read from the file
+            try:
+                _ = list(f.keys())
+                break
+            except Exception:
+                f.close()
+                f = None
+                continue
+        except Exception:
+            continue
+    
+    if f is None:
+        # Last resort: try default opening
+        f = h5py.File(file_path, 'r', **file_kwargs)
+    
+    try:
         # Get all top-level keys
         keys = list(f.keys())
         
         def extract_data(name: str, obj: h5py.Dataset | h5py.Group) -> None:
             """Recursively extract datasets from HDF5 file."""
             if isinstance(obj, h5py.Dataset):
-                data[name] = np.array(obj)
+                try:
+                    # Check if this is a compound type (structured array)
+                    dtype = obj.dtype
+                    is_compound = dtype.names is not None
+                    
+                    # Check if it's a complex number stored as compound type (r, i fields)
+                    is_complex_compound = (
+                        is_compound and 
+                        len(dtype.names) == 2 and 
+                        'r' in dtype.names and 
+                        'i' in dtype.names
+                    )
+                    
+                    if obj.size == 0:
+                        # Empty dataset
+                        if is_complex_compound:
+                            data[name] = np.array([], dtype=np.complex64)
+                        else:
+                            data[name] = np.array([], dtype=obj.dtype)
+                    elif obj.ndim == 0:
+                        # Scalar dataset
+                        if is_complex_compound:
+                            val = obj[()]
+                            data[name] = np.complex64(val['r'] + 1j * val['i'])
+                        else:
+                            data[name] = np.array(obj[()])
+                    else:
+                        # Multi-dimensional dataset
+                        # Try reading with low-level API first if regular read fails
+                        try:
+                            if is_complex_compound:
+                                # Read as structured array first, then convert to complex
+                                # Read in chunks to handle large datasets
+                                if obj.chunks is not None and obj.ndim == 3:
+                                    # Read plane by plane for 3D compound arrays
+                                    chunk_0 = obj.chunks[0] if obj.chunks else 64
+                                    arr_real = np.empty(obj.shape, dtype=np.float32)
+                                    arr_imag = np.empty(obj.shape, dtype=np.float32)
+                                    
+                                    for i in range(0, obj.shape[0], chunk_0):
+                                        end_i = min(i + chunk_0, obj.shape[0])
+                                        chunk_data = obj[i:end_i, :, :]
+                                        arr_real[i:end_i, :, :] = chunk_data['r']
+                                        arr_imag[i:end_i, :, :] = chunk_data['i']
+                                    
+                                    data[name] = arr_real + 1j * arr_imag
+                                else:
+                                    # Read entire array
+                                    arr_structured = obj[:]
+                                    data[name] = arr_structured['r'] + 1j * arr_structured['i']
+                            else:
+                                # Regular array - use full slice
+                                data[name] = obj[:]
+                        except (OSError, RuntimeError) as read_error:
+                            # If regular read fails, try using low-level API with custom properties
+                            try:
+                                import h5py._hl.dataset as ds
+                                # Create a new dataset access property list
+                                dapl = obj.id.get_access_plist()
+                                
+                                # Try reading with the dataset's own transfer properties
+                                if is_complex_compound:
+                                    arr_structured = np.empty(obj.shape, dtype=obj.dtype)
+                                    # Use read_direct with the dataset's own properties
+                                    obj.read_direct(arr_structured)
+                                    data[name] = arr_structured['r'] + 1j * arr_structured['i']
+                                else:
+                                    arr = np.empty(obj.shape, dtype=obj.dtype)
+                                    obj.read_direct(arr)
+                                    data[name] = arr
+                            except Exception:
+                                # Re-raise the original error to trigger fallback methods
+                                raise read_error
+                except (OSError, RuntimeError, ValueError) as e:
+                    # If slicing fails, try reading with read_direct
+                    try:
+                        dtype = obj.dtype
+                        is_compound = dtype.names is not None
+                        is_complex_compound = (
+                            is_compound and 
+                            len(dtype.names) == 2 and 
+                            'r' in dtype.names and 
+                            'i' in dtype.names
+                        )
+                        
+                        if is_complex_compound:
+                            # For compound types, read as structured array
+                            arr_structured = np.empty(obj.shape, dtype=obj.dtype)
+                            obj.read_direct(arr_structured, source_sel=None, dest_sel=None)
+                            data[name] = arr_structured['r'] + 1j * arr_structured['i']
+                        else:
+                            arr = np.empty(obj.shape, dtype=obj.dtype)
+                            obj.read_direct(arr, source_sel=None, dest_sel=None)
+                            data[name] = arr
+                    except Exception as e2:
+                        # Last resort: try reading in chunks aligned with dataset chunking
+                        try:
+                            dtype = obj.dtype
+                            is_compound = dtype.names is not None
+                            is_complex_compound = (
+                                is_compound and 
+                                len(dtype.names) == 2 and 
+                                'r' in dtype.names and 
+                                'i' in dtype.names
+                            )
+                            
+                            # Use dataset's chunk size if available, otherwise use reasonable defaults
+                            if obj.chunks is not None:
+                                chunk_sizes = obj.chunks
+                            else:
+                                # Default chunk sizes if not chunked
+                                if obj.ndim == 1:
+                                    chunk_sizes = (min(10000, obj.shape[0]),)
+                                elif obj.ndim == 2:
+                                    chunk_sizes = (min(1000, obj.shape[0]), obj.shape[1])
+                                else:
+                                    chunk_sizes = tuple(min(100, s) for s in obj.shape)
+                            
+                            if is_complex_compound:
+                                # For complex compound types, read as structured array in chunks
+                                arr_real = np.empty(obj.shape, dtype=np.float32)
+                                arr_imag = np.empty(obj.shape, dtype=np.float32)
+                                
+                                if obj.ndim == 3:
+                                    chunk_0 = chunk_sizes[0] if len(chunk_sizes) > 0 else 64
+                                    for i in range(0, obj.shape[0], chunk_0):
+                                        end_i = min(i + chunk_0, obj.shape[0])
+                                        chunk_data = obj[i:end_i, :, :]
+                                        arr_real[i:end_i, :, :] = chunk_data['r']
+                                        arr_imag[i:end_i, :, :] = chunk_data['i']
+                                elif obj.ndim == 2:
+                                    chunk_0 = chunk_sizes[0] if len(chunk_sizes) > 0 else 1000
+                                    for i in range(0, obj.shape[0], chunk_0):
+                                        end_i = min(i + chunk_0, obj.shape[0])
+                                        chunk_data = obj[i:end_i, :]
+                                        arr_real[i:end_i, :] = chunk_data['r']
+                                        arr_imag[i:end_i, :] = chunk_data['i']
+                                else:
+                                    chunk_data = obj[:]
+                                    arr_real = chunk_data['r']
+                                    arr_imag = chunk_data['i']
+                                
+                                data[name] = arr_real + 1j * arr_imag
+                            else:
+                                # Regular array reading
+                                arr = np.empty(obj.shape, dtype=obj.dtype)
+                                
+                                if obj.ndim == 1:
+                                    # 1D: read in chunks
+                                    chunk_size = chunk_sizes[0]
+                                    for i in range(0, obj.shape[0], chunk_size):
+                                        end = min(i + chunk_size, obj.shape[0])
+                                        arr[i:end] = obj[i:end]
+                                elif obj.ndim == 2:
+                                    # 2D: read in blocks aligned with chunks
+                                    chunk_0, chunk_1 = chunk_sizes[0], chunk_sizes[1]
+                                    for i in range(0, obj.shape[0], chunk_0):
+                                        end_i = min(i + chunk_0, obj.shape[0])
+                                        for j in range(0, obj.shape[1], chunk_1):
+                                            end_j = min(j + chunk_1, obj.shape[1])
+                                            arr[i:end_i, j:end_j] = obj[i:end_i, j:end_j]
+                                elif obj.ndim == 3:
+                                    # 3D: read in blocks aligned with chunks
+                                    chunk_0, chunk_1, chunk_2 = chunk_sizes[0], chunk_sizes[1], chunk_sizes[2]
+                                    for i in range(0, obj.shape[0], chunk_0):
+                                        end_i = min(i + chunk_0, obj.shape[0])
+                                        for j in range(0, obj.shape[1], chunk_1):
+                                            end_j = min(j + chunk_1, obj.shape[1])
+                                            for k in range(0, obj.shape[2], chunk_2):
+                                                end_k = min(k + chunk_2, obj.shape[2])
+                                                arr[i:end_i, j:end_j, k:end_k] = obj[i:end_i, j:end_j, k:end_k]
+                                else:
+                                    # Higher dimensions: read in smaller blocks
+                                    chunk_size = chunk_sizes[0] if len(chunk_sizes) > 0 else 100
+                                    for i in range(0, obj.shape[0], chunk_size):
+                                        end_i = min(i + chunk_size, obj.shape[0])
+                                        slices = (slice(i, end_i),) + (slice(None),) * (obj.ndim - 1)
+                                        arr[slices] = obj[slices]
+                                
+                                data[name] = arr
+                        except Exception as e3:
+                            # If all methods fail, try reading element-by-element or plane-by-plane
+                            # This is a last resort for corrupted or problematic files
+                            try:
+                                dtype = obj.dtype
+                                is_compound = dtype.names is not None
+                                is_complex_compound = (
+                                    is_compound and 
+                                    len(dtype.names) == 2 and 
+                                    'r' in dtype.names and 
+                                    'i' in dtype.names
+                                )
+                                
+                                if is_complex_compound:
+                                    # For complex compound types, read plane by plane
+                                    arr_real = np.empty(obj.shape, dtype=np.float32)
+                                    arr_imag = np.empty(obj.shape, dtype=np.float32)
+                                    
+                                    if obj.ndim == 3 and obj.shape[0] < 100000:
+                                        for i in range(obj.shape[0]):
+                                            try:
+                                                plane_data = obj[i, :, :]
+                                                arr_real[i, :, :] = plane_data['r']
+                                                arr_imag[i, :, :] = plane_data['i']
+                                            except Exception:
+                                                raise e3
+                                    elif obj.ndim == 2 and obj.shape[0] < 100000:
+                                        for i in range(obj.shape[0]):
+                                            try:
+                                                row_data = obj[i, :]
+                                                arr_real[i, :] = row_data['r']
+                                                arr_imag[i, :] = row_data['i']
+                                            except Exception:
+                                                raise e3
+                                    else:
+                                        raise e3
+                                    
+                                    data[name] = arr_real + 1j * arr_imag
+                                else:
+                                    # Regular array
+                                    arr = np.empty(obj.shape, dtype=obj.dtype)
+                                    if obj.ndim == 3 and obj.shape[0] < 100000:
+                                        for i in range(obj.shape[0]):
+                                            try:
+                                                arr[i, :, :] = obj[i, :, :]
+                                            except Exception:
+                                                raise e3
+                                    elif obj.ndim == 2 and obj.shape[0] < 100000:
+                                        for i in range(obj.shape[0]):
+                                            try:
+                                                arr[i, :] = obj[i, :]
+                                            except Exception:
+                                                raise e3
+                                    else:
+                                        raise e3
+                                    data[name] = arr
+                            except Exception as e4:
+                                # If all methods fail, raise an error
+                                # This will be caught by the outer handler if skip_errors=True
+                                raise OSError(
+                                    f"Failed to read dataset '{name}' (shape={obj.shape}, "
+                                    f"dtype={obj.dtype}, chunks={obj.chunks}). "
+                                    f"Original error: {e}. "
+                                    f"Alternative methods failed: {e2}, {e3}, {e4}"
+                                ) from e4
             elif isinstance(obj, h5py.Group):
                 # Recursively process groups
                 for key in obj.keys():
@@ -56,7 +344,27 @@ def read_hdf5_data(file_path: str | Path) -> tuple[dict[str, Any], list[str]]:
         
         # Extract all datasets
         for key in keys:
-            extract_data(key, f[key])
+            try:
+                extract_data(key, f[key])
+            except Exception as e:
+                if skip_errors:
+                    failed_datasets.append((key, str(e)))
+                    print(f"Warning: Skipping dataset '{key}': {e}")
+                else:
+                    raise
+        
+        if failed_datasets and skip_errors:
+            print(f"\nNote: {len(failed_datasets)} dataset(s) could not be read and were skipped.")
+            print("Failed datasets:", [name for name, _ in failed_datasets])
+            print("\nIf you're getting 'wrong B-tree signature' errors, the file may be corrupted.")
+            print("Try:")
+            print("  1. Use utils.open_hdf5_file() to access datasets directly")
+            print("  2. Repair the file using: h5repack input.hdf5 output.hdf5")
+            print("  3. Check if the file was properly closed when written")
+    
+    finally:
+        if f is not None:
+            f.close()
     
     return data, keys
 
@@ -187,6 +495,79 @@ def plot_polarizations(
         print(f"Figure saved to {save_path}")
     
     plt.show()
+
+
+def open_hdf5_file(
+    file_path: str | Path,
+    mode: str = 'r',
+    libver: str | None = None
+) -> h5py.File:
+    """
+    Open an HDF5 file with various fallback strategies.
+    
+    Parameters
+    ----------
+    file_path : str or Path
+        Path to the HDF5 file.
+    mode : str, default='r'
+        File access mode ('r' for read, 'r+' for read-write, etc.)
+    libver : str, optional
+        HDF5 library version compatibility.
+    
+    Returns
+    -------
+    h5py.File
+        Open HDF5 file object.
+    
+    Notes
+    -----
+    If you encounter "wrong B-tree signature" errors, the file may be corrupted
+    or written with an incompatible HDF5 version. Try:
+    1. Using h5repack to repair the file: `h5repack input.hdf5 output.hdf5`
+    2. Opening with different libver options
+    3. Checking if the file was properly closed when written
+    """
+    file_path = Path(file_path)
+    
+    if not file_path.exists():
+        raise FileNotFoundError(f"HDF5 file not found: {file_path}")
+    
+    file_kwargs = {}
+    if libver is not None:
+        file_kwargs['libver'] = libver
+    
+    strategies = [
+        {'mode': mode, **file_kwargs},
+        {'mode': mode, 'libver': 'latest', **{k: v for k, v in file_kwargs.items() if k != 'libver'}},
+        {'mode': mode, 'libver': 'earliest', **{k: v for k, v in file_kwargs.items() if k != 'libver'}},
+    ]
+    
+    last_error = None
+    for strategy in strategies:
+        try:
+            f = h5py.File(file_path, **strategy)
+            # Test if we can actually read from the file
+            try:
+                _ = list(f.keys())
+                return f
+            except Exception as e:
+                f.close()
+                last_error = e
+                continue
+        except Exception as e:
+            last_error = e
+            continue
+    
+    # Last resort: try default opening
+    try:
+        return h5py.File(file_path, mode, **file_kwargs)
+    except Exception as e:
+        raise OSError(
+            f"Failed to open HDF5 file '{file_path}'. "
+            f"Last error: {last_error or e}. "
+            f"The file may be corrupted or require repair. "
+            f"Try using 'h5repack' to repair the file."
+        ) from (last_error or e)
 
 
 def read_all_hdf5_files(data_dir: str | Path = "data_310") -> dict[str, tuple[dict, list]]:
