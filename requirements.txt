@@ -1,0 +1,32 @@
+# Core dependencies for skymap project
+# Used by: AltAzSim package, scripts, and tests
+#
+# Installation:
+#   pip install -r requirements.txt
+#   OR
+#   conda install --file requirements.txt
+
+# Astronomy and coordinate calculations
+# Used in: AltAzSim (telescope.py, scansession.py, coveragemap/), scripts/, tests/
+astropy>=7.0.0
+
+# Numerical computing
+# Used in: AltAzSim (all modules), scripts/, tests/
+numpy>=2.0.0
+
+# HEALPix sky map operations
+# Used in: AltAzSim/coveragemap/ (coveragemap.py, overlay.py, utils.py)
+healpy>=1.18.0
+
+# Plotting and visualization
+# Used in: AltAzSim/coveragemap/coveragemap.py, AltAzSim/utils/save_pdf.py
+matplotlib>=3.10.0
+
+# HDF5 file I/O
+# Used in: scripts/utils.py
+h5py>=3.10.0
+
+# Testing framework
+# Used in: tests/ (test_plot_sky_coverage_jan13_19.py, run_tests.py)
+pytest>=8.0.0
+

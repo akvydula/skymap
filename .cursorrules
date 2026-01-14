@@ -1,0 +1,12 @@
+# Cursor configuration for skymap project
+
+## Test Configuration
+- Use pytest for running tests (not unittest)
+- Test files should be run with: `pytest tests/ -v`
+- When running individual test files, use pytest programmatically for better output
+
+## Python Path
+- Project root: /Users/akshatha.vydula/skymap
+- AltAzSim package: /Users/akshatha.vydula/skymap/AltAzSim
+- Scripts package: /Users/akshatha.vydula/skymap/scripts
+
