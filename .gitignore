@@ -39,6 +39,7 @@ venv.bak/
 *.swp
 *.swo
 *~
+.cursorrules
 .DS_Store
 
 # Jupyter Notebook
