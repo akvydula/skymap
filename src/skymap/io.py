@@ -10,13 +10,14 @@ import os
 from datetime import datetime
 from pathlib import Path
 from typing import Any
-
+from astropy.io import fits
 import h5py
 import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
 import numpy as np
 from astropy.time import Time
 
+from skymap.utils import _time_to_mjd
 
 
 class SpecData:
@@ -316,3 +317,171 @@ def get_slice_from_time(data: HDF5Data, time_slice: slice) -> HDF5Data:
         kwargs["calibrated_spec"] = cal_sliced
 
     return HDF5Data(freq=data.freq, time=time_sliced, spec=spec_sliced, **kwargs)
+
+
+class PointingData:
+    """Container for pointing data with attribute access."""
+    def __init__(self, dmjd: np.ndarray, az: np.ndarray, el: np.ndarray, ra: np.ndarray, dec: np.ndarray, **kwargs):
+        self.dmjd = dmjd
+        self.az = az
+        self.el = el
+        self.ra = ra
+        self.dec = dec
+        for key, value in kwargs.items():
+            setattr(self, key, value)
+
+    def __repr__(self) -> str:
+        return f"PointingData(dmjd: {self.dmjd.shape}, az: {self.az.shape}, el: {self.el.shape}, ra: {self.ra.shape}, dec: {self.dec.shape}, **kwargs)"
+
+
+def read_pointing_fits(file_path: str | Path) -> PointingData:
+    """
+    Read a pointing data FITS file and return the data as a PointingData object.
+    Parameters
+    ----------
+    file_path : str or Path
+        Path to the FITS file.
+    Returns
+    -------
+    PointingData
+        PointingData object with attribute access.
+    """
+    with fits.open(file_path) as hdul:
+        dmjd = hdul['ANTPOSGR'].data['DMJD']
+        az = hdul['ANTPOSGR'].data['MNT_AZ']
+        el = hdul['ANTPOSGR'].data['MNT_EL']
+        ra = hdul['ANTPOSGR'].data['RAJ2000']
+        dec = hdul['ANTPOSGR'].data['DECJ2000']
+        
+        return PointingData(dmjd=dmjd, az=az, el=el, ra=ra, dec=dec)
+
+def find_pointing_files(datadir: str, date_of_observation: datetime, scan_number: np.ndarray) -> list[str]:
+            """
+            Find the pointing files for a scan.
+            Parameters
+            ----------
+            datadir : str
+                Data directory with pointing files.
+            date_of_observation : datetime
+                Date of observation.
+            scan_number : np.ndarray
+                Scan numbers.
+            """
+            datadir = Path(datadir)
+            if not datadir.exists():
+                raise FileNotFoundError(f"Data directory not found: {datadir}")
+
+            #First find all files for the date of observation and then append files for each scan number
+            all_files = glob.glob(
+            f"{datadir}/{date_of_observation.strftime('%Y_%m_%d')}_*.fits"
+        )
+
+            pointing_files = []
+
+            for s in scan_number:
+                matches = []
+
+                for file in all_files:
+                    if file.endswith(f":{s:02d}.fits"):
+                        matches.append(file)
+
+                if matches:
+                    for m in matches:
+                        print(f"Found pointing file for scan {s}: {m}")
+                    pointing_files.extend(matches)
+                else:
+                    print(f"Warning: No pointing file found for scan {s}")
+
+            return pointing_files  
+
+def read_pointing_files(pointing_files: list[str]) -> PointingData:
+    """
+    Read the pointing files and combine them into a single PointingData object.
+    Parameters
+    ----------
+    pointing_files : list[str]
+        List of pointing file paths.
+    Returns
+    -------
+    PointingData
+        Single PointingData object with all rows from all files concatenated
+        (dmjd, az, el, ra, dec in time order).
+    """
+    if not pointing_files:
+        raise ValueError("pointing_files must not be empty")
+    parts = [read_pointing_fits(f) for f in pointing_files]
+    return PointingData(
+        dmjd=np.concatenate([p.dmjd for p in parts]),
+        az=np.concatenate([p.az for p in parts]),
+        el=np.concatenate([p.el for p in parts]),
+        ra=np.concatenate([p.ra for p in parts]),
+        dec=np.concatenate([p.dec for p in parts]),
+    )
+
+def get_pointing_data(datadir: str, date_of_observation: datetime, scan_number: np.ndarray) -> PointingData:
+    """
+    Get the pointing data for a scan.
+    Parameters
+    ----------
+    datadir : str
+        Data directory with pointing files.
+    date_of_observation : datetime
+        Date of observation.
+    scan_number : np.ndarray
+        Scan numbers.
+    Returns
+    -------
+    PointingData
+        PointingData object.
+    """
+    pointing_files = find_pointing_files(datadir, date_of_observation, scan_number)
+    if len(pointing_files) == 0:
+        raise FileNotFoundError(f"No pointing files found for {date_of_observation} and scan {scan_number}")
+    else:
+        print(f"Found {len(pointing_files)} pointing files for {date_of_observation} and scan {scan_number}")   
+        pointing_data = read_pointing_files(pointing_files) 
+        if pointing_data is not None:   
+            print(f"Successfully read pointing data for {date_of_observation} and scan {scan_number}")
+            return pointing_data
+        else:
+            raise ValueError(f"Failed to read pointing data for {date_of_observation} and scan {scan_number}")
+            return None
+
+
+
+
+def match_data_and_pointing(data: HDF5Data, pointing_data: PointingData) -> HDF5Data:
+    """
+    Find the nearest pointing sample (by time) for each data time and attach ra, dec, el, az.
+
+    Both data.time and pointing_data.dmjd are converted to MJD (days) before matching
+    so that datetime, Unix, or MJD inputs are handled correctly.
+    Parameters
+    ----------
+    data : HDF5Data
+        Observation data (must have .time and .spec).
+    pointing_data : PointingData
+        Pointing data with dmjd, ra, dec, el, az.
+    Returns
+    -------
+    HDF5Data
+        Copy of data with ra, dec, el, az added (one value per data time, from nearest pointing).
+    """
+    data_mjd = _time_to_mjd(np.asarray(data.time))
+    pointing_mjd = np.asarray(pointing_data.dmjd, dtype=float)
+    # (n_time,) vs (n_pointing,) -> broadcast to (n_time, n_pointing), argmin along axis=1
+    diff = np.abs(data_mjd[:, np.newaxis] - pointing_mjd[np.newaxis, :])
+    nearest_indices = np.argmin(diff, axis=1)
+    ra = pointing_data.ra[nearest_indices]
+    dec = pointing_data.dec[nearest_indices]
+    el = pointing_data.el[nearest_indices]
+    az = pointing_data.az[nearest_indices]
+    # Preserve other attributes from data (e.g. calibrated_spec), excluding pointing (create those new)
+    skip = ("freq", "time", "spec", "ra", "dec", "el", "az")
+    extra = {k: getattr(data, k) for k in dir(data) if not k.startswith("_") and k not in skip}
+    # Always add pointing from this match (new or overwrite)
+    extra["ra"] = ra
+    extra["dec"] = dec
+    extra["el"] = el
+    extra["az"] = az
+    return HDF5Data(freq=data.freq, time=data.time, spec=data.spec, **extra)
