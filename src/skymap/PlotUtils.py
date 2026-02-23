@@ -264,27 +264,36 @@ def plot_waterwall_with_pointing(
     calibrated: bool = False,
     data_type: str = "mag",
     attribute: str | None = None,
+    use_std: bool = False,
     AzEL_map: bool = False,
     RADEC_map: bool = True,
     freq_avg: bool = True,
     save_path: str | Path | None = None,
+    size: float = 1,
+    clim: tuple[float, float] = [50, 200],
 ) -> None:
     """
     Plot the data with pointing (ra/dec or az/el).
 
     Uses the same data selection as plot_waterwall: calibrated, data_type, attribute.
+    When data has calibrated_spec_mean/calibrated_spec_std (from match_data_and_pointing),
+    use_std selects which to plot for each of the 10 pols.
     Parameters
     ----------
     data : HDF5Data
-        HDF5Data object containing frequency, time, and spec data.
+        HDF5Data object containing frequency, time, and spec data (or matched data with
+        calibrated_spec_mean / calibrated_spec_std).
     pointing_data : PointingData or None, default=None
         Pointing data. If None, ra/dec/az/el must already be on data.
     calibrated : bool, default=False
         If True, plot calibrated data (K).
     data_type : str, default="mag"
-        One of "real", "imag", "mag", "phase".
+        One of "real", "imag", "mag", "phase" (ignored when using mean/std).
     attribute : str or None, default=None
-        Which correlation to plot (e.g. "AA_", "AB_").
+        Which correlation to plot (e.g. "AA_", "AB_"). If None, uses first available.
+    use_std : bool, default=False
+        If True and data has calibrated_spec_mean/std (or spec_mean/spec_std), plot std
+        instead of mean for each pol.
     AzEL_map : bool, default=False
         If True, use az/el for axes; else use ra/dec.
     RADEC_map : bool, default=True
@@ -293,54 +302,72 @@ def plot_waterwall_with_pointing(
         If True, average over frequency.
     save_path : str or Path, optional
         If provided, save the figure to this path.
+    size : float, default=1
+        Size of the scatter points.
+    clim : tuple[float, float], optional
+        Color limits for the scatter plot.
     """
-
     if pointing_data is None:
-        #check if data has ra, dec, az, el
-        if data.ra is None or data.dec is None or data.az is None or data.el is None:
+        if getattr(data, "ra", None) is None or getattr(data, "dec", None) is None:
             raise ValueError("Pointing (ra, dec, az, el) required; provide pointing_data or pre-matched data")
-    elif pointing_data is not None:
+        ra = data.ra
+        dec = data.dec
+        az = data.az
+        el = data.el
+    else:
         data = io.match_data_and_pointing(data, pointing_data)
         ra = data.ra
         dec = data.dec
         az = data.az
         el = data.el
 
-    d = get_plot_data(
-        data,
-        calibrated=calibrated,
-        data_type=data_type,
-        attribute=attribute,
-    )
-    plot_data = d["plot_data"]
-    to_plot = d["to_plot"]
-    freq = d["freq"]
-    time = d["time"]
-
+    # Prefer mean/std from match_data_and_pointing when available
+    spec_mean = getattr(data, "calibrated_spec_mean", None) or getattr(data, "spec_mean", None)
+    spec_std = getattr(data, "calibrated_spec_std", None) or getattr(data, "spec_std", None)
+    if spec_mean is not None and spec_std is not None:
+        source = spec_std if use_std else spec_mean
+        plot_data = {name: getattr(source, name) for name in CAL_POL_NAMES if getattr(source, name, None) is not None}
+        if not plot_data:
+            raise ValueError("No mean/std channels available on data")
+        to_plot = [attribute] if attribute and attribute in plot_data else list(plot_data.keys())
+        if attribute is not None and attribute not in plot_data:
+            raise ValueError(f"attribute {attribute!r} not in mean/std data (available: {list(plot_data.keys())})")
+        freq = data.freq
+        time = data.time
+        cbar_label = "Temperature (K) std" if use_std else "Temperature (K) mean"
+    else:
+        d = get_plot_data(data, calibrated=calibrated, data_type=data_type, attribute=attribute)
+        plot_data = d["plot_data"]
+        to_plot = d["to_plot"]
+        freq = d["freq"]
+        time = d["time"]
+        cbar_label = d["cbar_label"]
 
     if AzEL_map:
         x_axis, y_axis = az, el
         x_label, y_label = "Azimuth (deg)", "Elevation (deg)"
     else:
         x_axis, y_axis = ra, dec
-        x_label, y_label = "RA (deg)", "Dec (deg)"
+        x_label, y_label = "RA (J2000)", "Dec (J2000)"
 
-    arr = plot_data[to_plot[0]]
+    # Use first requested pol (single plot)
+    pol_name = to_plot[0] if to_plot else list(plot_data.keys())[0]
+    arr = plot_data[pol_name]
+    print(arr.shape)
+    print(freq.shape)
+    print(time.shape)
     if freq_avg:
         arr_plot = np.nanmean(arr, axis=1)
-        plt.figure(figsize=(8, 6))
-        plt.scatter(x_axis, y_axis, c=arr_plot, cmap="viridis", s=1)
-        plt.colorbar(label=d["cbar_label"])
-        plt.xlabel(x_label)
-        plt.ylabel(y_label)
     else:
-        arr_plot = arr.T
-        plt.figure(figsize=(10, 5))
-        plt.imshow(arr_plot, aspect="auto", extent=[freq.min(), freq.max(), 0, len(time) - 1], origin="lower")
-        plt.colorbar(label=d["cbar_label"])
-        plt.xlabel("Frequency (MHz)")
-        plt.ylabel("Time index")
-    plt.title(f"{to_plot[0]} ({data_type})")
+        arr_plot = arr[:, len(freq) // 2]
+    print(arr_plot.shape, x_axis.shape, y_axis.shape)
+    plt.figure(figsize=(8, 6))
+    plt.scatter(x_axis, y_axis, c=arr_plot, cmap="viridis", s=size, vmin=clim[0], vmax=clim[1])
+    plt.colorbar(label=cbar_label)
+    plt.xlabel(x_label)
+    plt.ylabel(y_label)
+    stat_suffix = " (std)" if (use_std and spec_mean is not None) else (" (mean)" if (spec_mean is not None) else "")
+    plt.title(f"{pol_name} ({data_type}){stat_suffix}".strip())
     plt.tight_layout()
     if save_path is not None:
         plt.savefig(save_path, dpi=150, bbox_inches="tight")

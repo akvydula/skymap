@@ -7,9 +7,10 @@ from __future__ import annotations
 
 import glob
 import os
-from datetime import datetime
+import re
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Union
 from astropy.io import fits
 import h5py
 import matplotlib.dates as mdates
@@ -164,8 +165,9 @@ def read_obs_hdf5(
         Slice to apply to time dimension (e.g., slice(0, 38000)). 
         Default is None. Set to slice(0, 38000) to read first 38000 data. Set to None to read all data.
     time_mjd : bool, optional
-        If True, convert time values from MJD to datetime.
-        If False, convert time values from Unix timestamp to datetime. Default is False
+        Used only when the file has no "time_unit" attribute. If True, treat time as MJD (days);
+        if False, treat time as Unix timestamp in milliseconds. Files written by write_obs_hdf5
+        store time in Unix ms and set time_unit="unix_ms", so the correct conversion is used automatically.
     Returns
     -------
     HDF5Data
@@ -193,35 +195,125 @@ def read_obs_hdf5(
     f = h5py.File(file_path, 'r')
     
     try:
+        grp = f['data']
         # Read frequency data (convert to MHz)
-        freq = f['data']['freq'][()] / 1e6
-        
-        # Read spec data (complex array with shape: n_time, n-spectra, n_freq)
+        freq = grp['freq'][()] / 1e6
+
         if time_slice is not None:
-            spec_data = f['data']['spec'][time_slice, :, :]
-            time_data = f['data']['time'][time_slice]
+            time_data = grp['time'][time_slice]
         else:
-            spec_data = f['data']['spec']
-            time_data = f['data']['time']
+            time_data = grp['time'][()]
 
-        # Convert time_data to datetime 
-        if time_mjd:
-            time_data = np.array([Time(ts, format='mjd').datetime for ts in time_data])
+        # Convert time_data to datetime (naive UTC). Use stored unit so write/read round-trip matches.
+        time_unit = grp["time"].attrs.get("time_unit", None)
+        if time_unit == "mjd":
+            # MJD (days) UTC -> naive UTC datetime
+            time_data = np.array([Time(ts, format="mjd", scale="utc").datetime for ts in time_data])
+        elif time_unit == "unix_ms":
+            # Unix ms -> naive UTC datetime (avoid local-time fromtimestamp)
+            time_data = np.array([
+                datetime.fromtimestamp(ts / 1000, tz=timezone.utc).replace(tzinfo=None) for ts in time_data
+            ])
+        elif time_mjd:
+            time_data = np.array([Time(ts, format="mjd", scale="utc").datetime for ts in time_data])
         else:
-        # time values likely in Unix timestamp format in ms
-            time_data = np.array([datetime.fromtimestamp(ts/1000) for ts in time_data])
+            time_data = np.array([
+                datetime.fromtimestamp(ts / 1000, tz=timezone.utc).replace(tzinfo=None) for ts in time_data
+            ])
 
-        # spec_data shape: (n_time, n_spectra, n_freq) -> 2D (n_time, n_freq) per polarization
-        spec = SpecData(**{name: spec_data[:, i, :] for i, name in enumerate(CAL_POL_NAMES)})
-        
-        # Create HDF5Data object with datetime
-        data = HDF5Data(freq=freq, time=time_data, spec=spec)
-        
-        return data
-    
+        spec = None
+        if 'spec' in grp:
+            if time_slice is not None:
+                spec_data = grp['spec'][time_slice, :, :]
+            else:
+                spec_data = grp['spec'][()]
+            spec = SpecData(**{name: spec_data[:, i, :] for i, name in enumerate(CAL_POL_NAMES)})
+
+        kwargs = {}
+        if 'calibrated_spec' in grp:
+            if time_slice is not None:
+                cal_stack = grp['calibrated_spec'][time_slice, :, :]
+            else:
+                cal_stack = grp['calibrated_spec'][()]
+            cal = CalibratedSpec()
+            for i, name in enumerate(CAL_POL_NAMES):
+                ch = cal_stack[:, i, :]
+                setattr(cal, name, ch if np.any(np.isfinite(ch)) else None)
+            kwargs['calibrated_spec'] = cal
+
+        for key in ('ra', 'dec', 'el', 'az'):
+            if key in grp:
+                kwargs[key] = grp[key][time_slice] if time_slice is not None else grp[key][()]
+
+        return HDF5Data(freq=freq, time=time_data, spec=spec, **kwargs)
+
     finally:
         if f is not None:
             f.close()
+
+
+
+
+def write_obs_hdf5(data: HDF5Data, file_path: str | Path) -> None:
+    """
+    Write an HDF5 observation file with whatever information is present in the object.
+
+    Writes at any processing stage: only freq, time, and spec are required;
+    calibrated_spec, ra, dec, el, az are written if present (otherwise omitted or None).
+    Layout matches read_obs_hdf5: group "data" with datasets freq (Hz), time (MJD in days, with
+    time_unit="mjd"), spec (n_time, 10, n_freq), and optionally calibrated_spec, ra, dec, el, az.
+    Times are stored in MJD (UTC) so write/read round-trip preserves the same time axis.
+
+    Parameters
+    ----------
+    data : HDF5Data
+        Observation data (must have freq and time). spec, calibrated_spec, ra, dec, el, az
+        are written only when present.
+    file_path : str or Path
+        Output HDF5 path.
+    """
+    file_path = Path(file_path)
+    time_arr = np.asarray(data.time)
+    if len(time_arr) == 0:
+        raise ValueError("data.time must not be empty to write obs HDF5")
+    n_time = len(time_arr)
+    n_freq = len(data.freq)
+
+    with h5py.File(file_path, "w") as f:
+        grp = f.create_group("data")
+        grp.create_dataset("freq", data=np.asarray(data.freq, dtype=float) * 1e6)
+        time_mjd = _time_to_mjd(time_arr)
+        dset_time = grp.create_dataset("time", data=time_mjd.astype(float))
+        dset_time.attrs["time_unit"] = "mjd"  # MJD (days) UTC; read_obs_hdf5 converts to datetime
+
+        if data.spec is not None:
+            spec_stack = np.stack(
+                [getattr(data.spec, name) for name in CAL_POL_NAMES],
+                axis=1,
+            )
+            grp.create_dataset("spec", data=spec_stack)
+
+        cal = getattr(data, "calibrated_spec", None)
+        if cal is not None:
+            ref_shape = None
+            for name in CAL_POL_NAMES:
+                v = getattr(cal, name, None)
+                if v is not None:
+                    ref_shape = (n_time, n_freq)
+                    break
+            if ref_shape is not None:
+                cal_stack = np.full((n_time, len(CAL_POL_NAMES), n_freq), np.nan, dtype=float)
+                for i, name in enumerate(CAL_POL_NAMES):
+                    v = getattr(cal, name, None)
+                    if v is not None:
+                        cal_stack[:, i, :] = getattr(v, "value", v) if hasattr(v, "unit") else v
+                grp.create_dataset("calibrated_spec", data=cal_stack)
+
+        for key in ("ra", "dec", "el", "az"):
+            val = getattr(data, key, None)
+            if val is not None and isinstance(val, np.ndarray):
+                grp.create_dataset(key, data=np.asarray(val, dtype=float))
+
 
 # Same polarization order as SpecData (used for cal gain/te per channel)
 CAL_POL_NAMES = ['AA_', 'BB_', 'CC_', 'DD_', 'AB_', 'BC_', 'CD_', 'AC_', 'BD_', 'AD_']
@@ -355,44 +447,74 @@ def read_pointing_fits(file_path: str | Path) -> PointingData:
         
         return PointingData(dmjd=dmjd, az=az, el=el, ra=ra, dec=dec)
 
-def find_pointing_files(datadir: str, date_of_observation: datetime, scan_number: np.ndarray) -> list[str]:
-            """
-            Find the pointing files for a scan.
-            Parameters
-            ----------
-            datadir : str
-                Data directory with pointing files.
-            date_of_observation : datetime
-                Date of observation.
-            scan_number : np.ndarray
-                Scan numbers.
-            """
-            datadir = Path(datadir)
-            if not datadir.exists():
-                raise FileNotFoundError(f"Data directory not found: {datadir}")
+# Filename pattern: YYYY_MM_DD_HH:MM:SS.fits (UTC time in filename; colons in time part)
+_POINTING_FILENAME_PATTERN = re.compile(
+    r"^(\d{4})_(\d{2})_(\d{2})_(\d{2}):(\d{2}):(\d{2})\.fits$"
+)
 
-            #First find all files for the date of observation and then append files for each scan number
-            all_files = glob.glob(
-            f"{datadir}/{date_of_observation.strftime('%Y_%m_%d')}_*.fits"
-        )
 
-            pointing_files = []
+def _parse_pointing_filename_utc(path: Path) -> datetime | None:
+    """
+    Parse UTC time from pointing filename YYYY_MM_DD_HH:MM:SS.fits.
+    E.g. 2026_01_16_18:38:48.fits -> datetime(2026, 1, 16, 18, 38, 48).
+    Returns None if filename does not match.
+    """
+    m = _POINTING_FILENAME_PATTERN.match(path.name)
+    if m is None:
+        return None
+    y, mo, d, h, mi, s = map(int, m.groups())
+    return datetime(y, mo, d, h, mi, s)
 
-            for s in scan_number:
-                matches = []
 
-                for file in all_files:
-                    if file.endswith(f":{s:02d}.fits"):
-                        matches.append(file)
+def find_pointing_files(
+    datadir: str | Path,
+    start_utc: datetime,
+    end_utc: datetime,
+) -> list[str]:
+    """
+    Find pointing FITS files whose filename UTC time falls within [start_utc, end_utc].
 
-                if matches:
-                    for m in matches:
-                        print(f"Found pointing file for scan {s}: {m}")
-                    pointing_files.extend(matches)
-                else:
-                    print(f"Warning: No pointing file found for scan {s}")
+    Expects filenames like 2026_01_16_18:38:48.fits (YYYY_MM_DD_HH:MM:SS.fits).
+    Only files matching this pattern and with time in the given range are returned.
 
-            return pointing_files  
+    Parameters
+    ----------
+    datadir : str or Path
+        Directory containing pointing .fits files.
+    start_utc : datetime
+        Start of time range (UTC). Inclusive.
+    end_utc : datetime
+        End of time range (UTC). Inclusive.
+
+    Returns
+    -------
+    list[str]
+        Sorted list of full paths to matching .fits files.
+    """
+    datadir = Path(datadir)
+    if not datadir.exists():
+        raise FileNotFoundError(f"Data directory not found: {datadir}")
+
+    # Normalize to naive UTC for comparison (file times are parsed as naive UTC)
+    def _to_utc_naive(dt: datetime) -> datetime:
+        if dt.tzinfo is not None:
+            return dt.astimezone(timezone.utc).replace(tzinfo=None)
+        return dt
+
+    start_utc = _to_utc_naive(start_utc)
+    end_utc = _to_utc_naive(end_utc)
+    if start_utc > end_utc:
+        raise ValueError(f"start_utc must be <= end_utc, got {start_utc} and {end_utc}")
+
+    pointing_files = []
+    for path in datadir.glob("*.fits"):
+        file_utc = _parse_pointing_filename_utc(path)
+        if file_utc is None:
+            continue
+        if start_utc <= file_utc <= end_utc:
+            pointing_files.append(str(path.resolve()))
+
+    return sorted(pointing_files)  
 
 def read_pointing_files(pointing_files: list[str]) -> PointingData:
     """
@@ -418,70 +540,150 @@ def read_pointing_files(pointing_files: list[str]) -> PointingData:
         dec=np.concatenate([p.dec for p in parts]),
     )
 
-def get_pointing_data(datadir: str, date_of_observation: datetime, scan_number: np.ndarray) -> PointingData:
+def get_pointing_data(datadir: str | Path, start_utc: datetime, end_utc: datetime) -> PointingData:
     """
-    Get the pointing data for a scan.
+    Get pointing data for files within a UTC time range.
+
     Parameters
     ----------
-    datadir : str
-        Data directory with pointing files.
-    date_of_observation : datetime
-        Date of observation.
-    scan_number : np.ndarray
-        Scan numbers.
+    datadir : str or Path
+        Data directory with pointing FITS files (names like YYYY_MM_DD_HH_MM_SS.fits).
+    start_utc : datetime
+        Start of time range (UTC), inclusive.
+    end_utc : datetime
+        End of time range (UTC), inclusive.
+
     Returns
     -------
     PointingData
-        PointingData object.
+        PointingData object combining all files in the range.
     """
-    pointing_files = find_pointing_files(datadir, date_of_observation, scan_number)
+    pointing_files = find_pointing_files(datadir, start_utc, end_utc)
     if len(pointing_files) == 0:
-        raise FileNotFoundError(f"No pointing files found for {date_of_observation} and scan {scan_number}")
-    else:
-        print(f"Found {len(pointing_files)} pointing files for {date_of_observation} and scan {scan_number}")   
-        pointing_data = read_pointing_files(pointing_files) 
-        if pointing_data is not None:   
-            print(f"Successfully read pointing data for {date_of_observation} and scan {scan_number}")
-            return pointing_data
-        else:
-            raise ValueError(f"Failed to read pointing data for {date_of_observation} and scan {scan_number}")
-            return None
+        raise FileNotFoundError(f"No pointing files found in {datadir} between {start_utc} and {end_utc}")
+    print(f"Found {len(pointing_files)} pointing files between {start_utc} and {end_utc}")
+    return read_pointing_files(pointing_files)
 
 
 
 
-def match_data_and_pointing(data: HDF5Data, pointing_data: PointingData) -> HDF5Data:
+def match_data_and_pointing(
+    data: HDF5Data,
+    pointing_data: Union[PointingData, list[str]],
+) -> HDF5Data:
     """
-    Find the nearest pointing sample (by time) for each data time and attach ra, dec, el, az.
+    Match spec (or calibrated_spec) to pointing by time windows: for each pointing sample,
+    use all spec data within 50% of the interval to adjacent pointing samples; compute
+    mean and std over those spec samples for all 10 polarizations.
 
-    Both data.time and pointing_data.dmjd are converted to MJD (days) before matching
-    so that datetime, Unix, or MJD inputs are handled correctly.
+    Spec is at higher time resolution than pointing. For each pointing time, the window
+    is [t_i - 0.5*dt_left, t_i + 0.5*dt_right] where dt_left = t_i - t_{i-1} and
+    dt_right = t_{i+1} - t_i (at edges, use the single adjacent interval).
+
     Parameters
     ----------
     data : HDF5Data
-        Observation data (must have .time and .spec).
-    pointing_data : PointingData
-        Pointing data with dmjd, ra, dec, el, az.
+        Observation data with .time and .spec and/or .calibrated_spec.
+    pointing_data : PointingData or list[str]
+        Pointing data, or list of pointing file paths (read with read_pointing_files).
     Returns
     -------
     HDF5Data
-        Copy of data with ra, dec, el, az added (one value per data time, from nearest pointing).
+        One row per pointing: time (pointing times), ra, dec, el, az, and
+        calibrated_spec_mean / calibrated_spec_std (or spec_mean / spec_std if no
+        calibrated_spec), each with 10 pols of shape (n_pointing, n_freq).
     """
+    if isinstance(pointing_data, list):
+        pointing_data = read_pointing_files(pointing_data)
+    # Ensure both times are in the same units (MJD in days) for window matching
     data_mjd = _time_to_mjd(np.asarray(data.time))
-    pointing_mjd = np.asarray(pointing_data.dmjd, dtype=float)
-    # (n_time,) vs (n_pointing,) -> broadcast to (n_time, n_pointing), argmin along axis=1
-    diff = np.abs(data_mjd[:, np.newaxis] - pointing_mjd[np.newaxis, :])
-    nearest_indices = np.argmin(diff, axis=1)
-    ra = pointing_data.ra[nearest_indices]
-    dec = pointing_data.dec[nearest_indices]
-    el = pointing_data.el[nearest_indices]
-    az = pointing_data.az[nearest_indices]
-    # Preserve other attributes from data (e.g. calibrated_spec), excluding pointing (create those new)
-    skip = ("freq", "time", "spec", "ra", "dec", "el", "az")
-    extra = {k: getattr(data, k) for k in dir(data) if not k.startswith("_") and k not in skip}
-    # Always add pointing from this match (new or overwrite)
-    extra["ra"] = ra
-    extra["dec"] = dec
-    extra["el"] = el
-    extra["az"] = az
-    return HDF5Data(freq=data.freq, time=data.time, spec=data.spec, **extra)
+    pointing_mjd = _time_to_mjd(np.asarray(pointing_data.dmjd, dtype=float))
+    n_pointing = len(pointing_mjd)
+    n_freq = len(data.freq)
+
+    # Time window per pointing: 50% offset on each side of the interval
+    dt_left = np.empty(n_pointing)
+    dt_right = np.empty(n_pointing)
+    if n_pointing == 1:
+        span = np.max(data_mjd) - np.min(data_mjd) if len(data_mjd) > 1 else 1.0 / 86400  # 1 sec in days
+        dt_left[0] = dt_right[0] = span
+    else:
+        dt_left[0] = pointing_mjd[1] - pointing_mjd[0]
+        dt_right[-1] = pointing_mjd[-1] - pointing_mjd[-2]
+        for i in range(1, n_pointing):
+            dt_left[i] = pointing_mjd[i] - pointing_mjd[i - 1]
+        for i in range(n_pointing - 1):
+            dt_right[i] = pointing_mjd[i + 1] - pointing_mjd[i]
+    left = pointing_mjd - 0.5 * dt_left
+    right = pointing_mjd + 0.5 * dt_right
+
+    # Sanity check: raise only if no window has any spec data (some windows may have none)
+    at_least_one_window_overlaps = any(
+        np.any((data_mjd >= left[i]) & (data_mjd <= right[i])) for i in range(n_pointing)
+    )
+    if not at_least_one_window_overlaps:
+        raise ValueError(
+            "No pointing window contains any spec times. "
+            "Check that data.time and pointing_data.dmjd use the same time convention "
+            "(both are converted to MJD days internally). "
+            f"data_mjd range: [{data_mjd.min():.4f}, {data_mjd.max():.4f}]; "
+            f"pointing window range: [{left.min():.4f}, {right.max():.4f}]"
+        )
+
+    # Prefer calibrated_spec; fall back to spec (use .value if Quantity)
+    if getattr(data, "calibrated_spec", None) is not None:
+        spec_source = data.calibrated_spec
+        mean_suffix, std_suffix = "calibrated_spec_mean", "calibrated_spec_std"
+    else:
+        if data.spec is None:
+            raise ValueError("data must have spec or calibrated_spec for match_data_and_pointing")
+        spec_source = data.spec
+        mean_suffix, std_suffix = "spec_mean", "spec_std"
+
+    def _to_array(v):
+        return getattr(v, "value", v) if getattr(v, "unit", None) is not None else np.asarray(v)
+
+    mean_arrays = {}
+    std_arrays = {}
+    for name in CAL_POL_NAMES:
+        arr = getattr(spec_source, name, None)
+        if arr is None:
+            mean_arrays[name] = np.full((n_pointing, n_freq), np.nan, dtype=float)
+            std_arrays[name] = np.full((n_pointing, n_freq), np.nan, dtype=float)
+            continue
+        arr = _to_array(arr)
+        if arr.ndim != 2 or arr.shape[1] != n_freq:
+            raise ValueError(f"spec {name} shape {arr.shape} inconsistent with n_freq={n_freq}")
+        means = np.full((n_pointing, n_freq), np.nan, dtype=float)
+        stds = np.full((n_pointing, n_freq), np.nan, dtype=float)
+        for i in range(n_pointing):
+            mask = (data_mjd >= left[i]) & (data_mjd <= right[i])
+            if np.any(mask):
+                means[i, :] = np.nanmean(arr[mask, :], axis=0)
+                stds[i, :] = np.nanstd(arr[mask, :], axis=0)
+        mean_arrays[name] = means
+        std_arrays[name] = stds
+
+    mean_spec = CalibratedSpec()
+    std_spec = CalibratedSpec()
+    for name in CAL_POL_NAMES:
+        setattr(mean_spec, name, mean_arrays[name])
+        setattr(std_spec, name, std_arrays[name])
+
+    # Pointing time: use datetime if data.time was datetime, else keep MJD
+    if len(data.time) > 0 and isinstance(np.asarray(data.time).flat[0], (datetime, np.datetime64)):
+        pointing_time = np.array([Time(t, format="mjd").datetime for t in pointing_mjd])
+    else:
+        pointing_time = pointing_mjd
+
+    # Build return explicitly at pointing resolution (do not copy ra/dec/etc from data)
+    return HDF5Data(
+        freq=data.freq,
+        time=pointing_time,
+        spec=None,
+        ra=np.asarray(pointing_data.ra),
+        dec=np.asarray(pointing_data.dec),
+        el=np.asarray(pointing_data.el),
+        az=np.asarray(pointing_data.az),
+        **{mean_suffix: mean_spec, std_suffix: std_spec},
+    )
