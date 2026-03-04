@@ -687,3 +687,22 @@ def match_data_and_pointing(
         az=np.asarray(pointing_data.az),
         **{mean_suffix: mean_spec, std_suffix: std_spec},
     )
+
+
+    '''
+use nside of 512
+
+to get the number of pixels in the map, use the following code:
+
+4*pi*360 deg 
+
+Each pixel is 3.8 arcmin in radius 
+(77 sq. arcmin)
+beam is 1 sq. degree in size, so the radius is 0.56 deg
+
+every 0.56 deg of the beam gets 77 pixels that get assigned the same value. 
+Take mean and std of the pixels to get the mean and std of all the values that get assigned to the pixel. 
+
+we also need to take a convolution of the beam and the pixels. 
+
+    '''
