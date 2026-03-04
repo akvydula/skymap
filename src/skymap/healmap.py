@@ -89,6 +89,22 @@ def _add_beam_indicator_radec(ax, region: tuple[float, float, float]) -> None:
     ax.plot(ra_c, dec_c, "k-", lw=1.5)
 
 
+def _apply_axes_kwargs(ax, kwargs: dict) -> None:
+    """Apply remaining matplotlib axes kwargs (e.g. title, xlabel, ylabel, xlim, ylim)."""
+    # Explicit setters for common args (kwargs already stripped of clim, xlabel, ylabel, title if used)
+    for key, val in list(kwargs.items()):
+        setter = getattr(ax, f"set_{key}", None)
+        if callable(setter):
+            setter(val)
+            kwargs.pop(key, None)
+    # Any remaining (e.g. xlim, ylim) via ax.set()
+    if kwargs:
+        try:
+            ax.set(**kwargs)
+        except (TypeError, AttributeError):
+            pass
+
+
 def _set_plot_labels_and_cbar_style() -> None:
     """
     Healpy uses axis('off') so set_xlabel/set_ylabel are hidden; we use text annotations instead."""
@@ -304,12 +320,23 @@ class HealPixMap:
         sub: tuple[int, int, int] | None = None,
         show_beam: bool = True,
         ra_dec_map: bool = False,
+        **kwargs,
     ) -> None:
-        """Plot a single map: if ra_dec_map=True (and region given) use RA/Dec axes; else regular healpy (mollview or gnomview)."""
+        """Plot a single map: if ra_dec_map=True (and region given) use RA/Dec axes; else regular healpy (mollview or gnomview).
+        Extra kwargs (e.g. clim, xlabel, ylabel) are applied to the plot/axes."""
+        kwargs = dict(kwargs)  # don't mutate caller's dict when used for multiple subplots
         to_plot = np.asarray(map_array, dtype=float).copy()
         to_plot[np.isnan(to_plot)] = hp.UNSEEN
         if mask_uncovered:
             to_plot[to_plot == 0] = hp.UNSEEN
+
+        # Consume plot-level kwargs (clim is (vmin, vmax); healpy uses min/max)
+        clim = kwargs.pop("clim", None)
+        xlabel = kwargs.pop("xlabel", None)
+        ylabel = kwargs.pop("ylabel", None)
+        plot_title = kwargs.pop("title", None)
+        if plot_title is not None:
+            title = plot_title
 
         if ra_dec_map:
             if region is None:
@@ -334,24 +361,30 @@ class HealPixMap:
             pixel_deg = np.sqrt(self.pixel_area_sqdeg)
             s = max(1, 4 * (pixel_deg / extent_deg * 400) ** 2)
             sc = ax.scatter(ra, dec, c=vals, cmap=cmap, s=s, edgecolors="none")
+            if clim is not None:
+                sc.set_clim(clim[0], clim[1])
             ax.set_xlim(center_ra - extent_deg / 2, center_ra + extent_deg / 2)
             ax.set_ylim(center_dec - extent_deg / 2, center_dec + extent_deg / 2)
-            ax.set_xlabel("RA")
-            ax.set_ylabel("Dec")
+            ax.set_xlabel(xlabel if xlabel is not None else "RA")
+            ax.set_ylabel(ylabel if ylabel is not None else "Dec")
             ax.set_aspect("equal")
             ax.set_title(title or "")
             cb = plt.colorbar(sc, ax=ax)
             cb.set_label(unit or "", fontweight="normal")
             if show_beam:
                 _add_beam_indicator_radec(ax, region)
+            _apply_axes_kwargs(ax, kwargs)
             return
 
         # Regular healpy plot: mollview (full sky) or gnomview (region)
-        kwargs = dict(title=title, unit=unit, cbar=True, cmap=cmap)
+        hp_kw = dict(title=title, unit=unit, cbar=True, cmap=cmap)
+        if clim is not None:
+            hp_kw["min"] = clim[0]
+            hp_kw["max"] = clim[1]
         if sub is not None:
-            kwargs["sub"] = sub
+            hp_kw["sub"] = sub
         if region is None:
-            hp.mollview(to_plot, **kwargs)
+            hp.mollview(to_plot, **hp_kw)
         else:
             center_ra, center_dec, area_sqdeg = region
             extent_deg = np.sqrt(float(area_sqdeg))
@@ -362,11 +395,17 @@ class HealPixMap:
                 rot=(center_ra, center_dec),
                 reso=reso_arcmin,
                 xsize=xsize,
-                **kwargs,
+                **hp_kw,
             )
         _set_plot_labels_and_cbar_style()
         if show_beam:
             _add_beam_indicator(region)
+        ax = plt.gca()
+        if xlabel is not None:
+            ax.set_xlabel(xlabel)
+        if ylabel is not None:
+            ax.set_ylabel(ylabel)
+        _apply_axes_kwargs(ax, kwargs)
 
     def _cbar_label(self, attribute: str | None, stat: Literal["mean", "std"]) -> str:
         """Build color bar label: '{attribute} {stat} [K]' (e.g. 'AA_ Mean K'), not bold."""
@@ -424,8 +463,15 @@ class HealPixMap:
             If True, plot with RA as X axis and Dec as Y axis (requires region).
             If False (default), use regular healpy projection (mollview or gnomview).
         **kwargs : dict, optional
-            Additional keyword arguments passed to plt.figure().
+            Matplotlib/plot arguments applied to the plot: e.g. title, clim (vmin, vmax),
+            xlabel, ylabel, xlim, ylim. Figure-related (figsize, dpi, etc.) are used when
+            creating the figure.
         """
+        # Split figure kwargs (for plt.figure) from plot kwargs (for _plot_one)
+        figure_keys = {"figsize", "dpi", "facecolor", "edgecolor", "frameon", "num", "clear"}
+        figure_kw = {k: v for k, v in kwargs.items() if k in figure_keys}
+        plot_kw = {k: v for k, v in kwargs.items() if k not in figure_keys}
+
         if stat == "std":
             def _get_arr(attr: str | None) -> np.ndarray:
                 return self.get_std(attr)
@@ -436,6 +482,8 @@ class HealPixMap:
         if attribute is not None:
             if attribute not in self._channel_maps:
                 raise KeyError(f"No map for {attribute!r}. Available: {list(self._channel_maps.keys())}")
+            if figure_kw:
+                plt.figure(**figure_kw)
             self._plot_one(
                 _get_arr(attribute),
                 title=title or attribute,
@@ -445,6 +493,7 @@ class HealPixMap:
                 region=region,
                 show_beam=show_beam,
                 ra_dec_map=ra_dec_map,
+                **plot_kw,
             )
             if show:
                 plt.show()
@@ -456,7 +505,7 @@ class HealPixMap:
             n = len(names)
             ncol = min(n, 3)
             nrow = (n + ncol - 1) // ncol
-            plt.figure(figsize=(5 * ncol, 4 * nrow), **kwargs)
+            plt.figure(figsize=(5 * ncol, 4 * nrow), **figure_kw)
             if title:
                 plt.suptitle(title)
             for i, name in enumerate(names):
@@ -470,6 +519,7 @@ class HealPixMap:
                     sub=(nrow, ncol, i + 1),
                     show_beam=show_beam,
                     ra_dec_map=ra_dec_map,
+                    **plot_kw,
                 )
             plt.tight_layout()
             if show:
@@ -477,6 +527,8 @@ class HealPixMap:
                 plt.close()
             return
 
+        if figure_kw:
+            plt.figure(**figure_kw)
         self._plot_one(
             _get_arr(None),
             title=title,
@@ -486,7 +538,22 @@ class HealPixMap:
             region=region,
             show_beam=show_beam,
             ra_dec_map=ra_dec_map,
+            **plot_kw,
         )
         if show:
             plt.show()
             plt.close()
+
+    '''
+    histogram and pointing offset 
+    Start with RA and Dec of the source from the catalogue
+    x-axis should be pointing offset in degrees from the source 
+    - radial distance
+    - az
+    - alt
+    y-axis is the temperature in K
+    bin this into a histogram with bin size of 0.1 deg
+    fit a gaussian to the histogram and 
+    that should give us the beam (full beam of the feed+dish)
+    use that beam size to do the convolution with the beam map
+    '''
