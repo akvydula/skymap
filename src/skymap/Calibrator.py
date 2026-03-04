@@ -27,7 +27,7 @@ def get_Tsys_lab(corr_spec: np.ndarray, gain: np.ndarray):
 
     Tsys = V_measured**2 / (k_B * rbw * R * G)
 
-    for two sided spectrum normalization in the spectrometer, we divide by 2. So,
+    for two sided spectrum normalization (+1/-1 scaling) in the spectrometer, we divide by 2. So,
 
     Tsys = V_measured**2 / (2 *k_B * rbw * R * G)
     where:
