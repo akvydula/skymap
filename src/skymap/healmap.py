@@ -234,35 +234,69 @@ class HealPixMap:
             return self._channel_stds[attribute]
         raise KeyError(f"No std for attribute {attribute!r}. Available: {list(self._channel_stds.keys())}")
 
+    def get_map_radec_values(
+        self, attribute: str | None = None
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Return (ra_deg, dec_deg, values) for all pixels with valid data, for use
+        with beam histogram functions in Beam.py.
+
+        Only pixels with hit_count > 0 and finite map values are included.
+        RA and Dec are in degrees (lonlat=True). Values are the map mean (e.g. in K).
+
+        Parameters
+        ----------
+        attribute : str or None
+            PolChannel to use (e.g. 'AA_', 'BB_'). If None, the main map is used.
+
+        Returns
+        -------
+        ra_deg : np.ndarray
+            Right ascension in degrees (length n_valid).
+        dec_deg : np.ndarray
+            Declination in degrees (length n_valid).
+        values : np.ndarray
+            Map values (e.g. mean in K) for each pixel (length n_valid).
+        """
+        map_vals = self.get_map(attribute)
+        hit_count = self.get_hit_count()
+        valid = (hit_count > 0) & np.isfinite(map_vals)
+        ipix = np.where(valid)[0]
+        if ipix.size == 0:
+            return (
+                np.array([], dtype=float),
+                np.array([], dtype=float),
+                np.array([], dtype=float),
+            )
+        ra_deg, dec_deg = hp.pix2ang(self.nside, ipix, lonlat=True)
+        values = np.asarray(map_vals[ipix], dtype=float)
+        return ra_deg, dec_deg, values
+
     def _plot_one(
         self,
         map_array: np.ndarray,
         *,
-        title: str | None = "HealPix map",
         unit: str | None = None,
-        cmap: str = "viridis",
         mask_uncovered: bool = True,
         region: tuple[float, float, float] | None = None,
         sub: tuple[int, int, int] | None = None,
-        show_beam: bool = True,
         ra_dec_map: bool = False,
         **kwargs,
     ) -> None:
         """Plot a single map: if ra_dec_map=True (and region given) use RA/Dec axes; else full-sky mollview.
-        When region is specified, ra_dec_map must be True. Extra kwargs (e.g. clim, xlabel, ylabel) are applied to the plot/axes."""
+        When region is specified, ra_dec_map must be True. Extra kwargs (e.g. title, cmap, clim, xlabel, ylabel) are applied to the plot/axes."""
         kwargs = dict(kwargs)  # don't mutate caller's dict when used for multiple subplots
         to_plot = np.asarray(map_array, dtype=float).copy()
         to_plot[np.isnan(to_plot)] = hp.UNSEEN
         if mask_uncovered:
             to_plot[to_plot == 0] = hp.UNSEEN
 
-        # Consume plot-level kwargs (clim is (vmin, vmax); healpy uses min/max)
+        # Consume plot-level kwargs (clim, title, cmap; healpy uses min/max)
         clim = kwargs.pop("clim", None)
+        title = kwargs.pop("title", "HealPix map")
+        cmap = kwargs.pop("cmap", "viridis")
         xlabel = kwargs.pop("xlabel", None)
         ylabel = kwargs.pop("ylabel", None)
-        plot_title = kwargs.pop("title", None)
-        if plot_title is not None:
-            title = plot_title
 
         if region is not None and not ra_dec_map:
             raise ValueError("When a region is specified, ra_dec_map must be True")
@@ -299,8 +333,7 @@ class HealPixMap:
             ax.set_title(title or "")
             cb = plt.colorbar(sc, ax=ax)
             cb.set_label(unit or "", fontweight="normal")
-            if show_beam:
-                _add_beam_indicator_radec(ax, region)
+            _add_beam_indicator_radec(ax, region)
             _apply_axes_kwargs(ax, kwargs)
             return
 
@@ -315,24 +348,14 @@ class HealPixMap:
         ax = plt.gca()
         _apply_axes_kwargs(ax, kwargs)
 
-    def _cbar_label(self, attribute: str | None, stat: Literal["mean", "std"]) -> str:
-        """Build color bar label: '{attribute} {stat} [K]' (e.g. 'AA_ Mean K'), not bold."""
-        stat_str = stat.capitalize()
-        parts = [attribute, stat_str, "K"] if attribute else [stat_str, "K"]
-        return " ".join(parts)
-
     def plot(
         self,
         *,
         attribute: str | None = None,
         stat: Literal["mean", "std"] = "mean",
-        title: str | None = "HealPix map",
         unit: str | None = None,
-        cmap: str = "viridis",
         mask_uncovered: bool = True,
-        show: bool = True,
         region: tuple[float, float, float] | None = None,
-        show_beam: bool = True,
         ra_dec_map: bool = False,
         **kwargs,
     ) -> None:
@@ -340,8 +363,8 @@ class HealPixMap:
         Plot the map.
 
         If ra_dec_map=True (and region given): plot with RA and Dec as X/Y axes using
-        healpix pixels in the region (query_disc + pix2ang). Otherwise: full-sky mollview.
-        When region is specified, ra_dec_map must be True.
+        healpix pixels in the region (query_disc + pix2ang); beam circle is drawn automatically.
+        Otherwise: full-sky mollview. When region is specified, ra_dec_map must be True.
 
         Parameters
         ----------
@@ -351,29 +374,19 @@ class HealPixMap:
             main (hit count) map.
         stat : {'mean', 'std'}, optional
             Plot mean map or standard-deviation map. Default 'mean'.
-        title : str or None, optional
-            Plot title. If None, no title is shown. For multiple channels, used as
-            figure suptitle.
         unit : str or None, optional
             Unused; color bar title is always '{attribute} {stat} K'.
-        cmap : str, optional
-            Matplotlib colormap name (default "viridis").
         mask_uncovered : bool, optional
             If True (default), pixels with no hits (value 0) are masked as UNSEEN.
-        show : bool, optional
-            If True (default), call plt.show() after drawing.
         region : tuple (center_ra, center_dec, area_sqdeg) or None, optional
             Patch to plot. Required when ra_dec_map=True. When region is given,
             ra_dec_map must be True. When None and ra_dec_map=False, mollview (full sky) is used.
-        show_beam : bool, optional
-            If True (default), draw the 1 sq.deg beam circle.
         ra_dec_map : bool, optional
             If True, plot with RA as X axis and Dec as Y axis (requires region).
-            If False (default), use regular healpy projection (mollview or gnomview).
+            If False (default), use regular healpy projection (mollview).
         **kwargs : dict, optional
-            Matplotlib/plot arguments applied to the plot: e.g. title, clim (vmin, vmax),
-            xlabel, ylabel, xlim, ylim. Figure-related (figsize, dpi, etc.) are used when
-            creating the figure.
+            Matplotlib/plot arguments: e.g. title, cmap, clim (vmin, vmax), xlabel, ylabel,
+            xlim, ylim. Figure-related (figsize, dpi, etc.) are used when creating the figure.
         """
         # Split figure kwargs (for plt.figure) from plot kwargs (for _plot_one)
         figure_keys = {"figsize", "dpi", "facecolor", "edgecolor", "frameon", "num", "clear"}
@@ -387,6 +400,9 @@ class HealPixMap:
             def _get_arr(attr: str | None) -> np.ndarray:
                 return self.get_map(attr)
 
+        stat_str = stat.capitalize()
+        cbar_label = lambda attr: f"{attr} {stat_str} K" if attr else f"{stat_str} K"
+
         if attribute is not None:
             if attribute not in self._channel_maps:
                 raise KeyError(f"No map for {attribute!r}. Available: {list(self._channel_maps.keys())}")
@@ -394,18 +410,14 @@ class HealPixMap:
                 plt.figure(**figure_kw)
             self._plot_one(
                 _get_arr(attribute),
-                title=title or attribute,
-                unit=self._cbar_label(attribute, stat),
-                cmap=cmap,
+                unit=cbar_label(attribute),
                 mask_uncovered=mask_uncovered,
                 region=region,
-                show_beam=show_beam,
                 ra_dec_map=ra_dec_map,
-                **plot_kw,
+                **{**plot_kw, "title": plot_kw.get("title", attribute)},
             )
-            if show:
-                plt.show()
-                plt.close()
+            plt.show()
+            plt.close()
             return
 
         if self._channel_maps:
@@ -414,54 +426,32 @@ class HealPixMap:
             ncol = min(n, 3)
             nrow = (n + ncol - 1) // ncol
             plt.figure(figsize=(5 * ncol, 4 * nrow), **figure_kw)
-            if title:
-                plt.suptitle(title)
+            if plot_kw.get("title"):
+                plt.suptitle(plot_kw["title"])
             for i, name in enumerate(names):
                 self._plot_one(
                     _get_arr(name),
-                    title=name,
-                    unit=self._cbar_label(name, stat),
-                    cmap=cmap,
+                    unit=cbar_label(name),
                     mask_uncovered=mask_uncovered,
                     region=region,
                     sub=(nrow, ncol, i + 1),
-                    show_beam=show_beam,
                     ra_dec_map=ra_dec_map,
-                    **plot_kw,
+                    **{**plot_kw, "title": name},
                 )
             plt.tight_layout()
-            if show:
-                plt.show()
-                plt.close()
+            plt.show()
+            plt.close()
             return
 
         if figure_kw:
             plt.figure(**figure_kw)
         self._plot_one(
             _get_arr(None),
-            title=title,
-            unit=self._cbar_label(None, stat),
-            cmap=cmap,
+            unit=cbar_label(None),
             mask_uncovered=mask_uncovered,
             region=region,
-            show_beam=show_beam,
             ra_dec_map=ra_dec_map,
             **plot_kw,
         )
-        if show:
-            plt.show()
-            plt.close()
-
-    '''
-    histogram and pointing offset 
-    Start with RA and Dec of the source from the catalogue
-    x-axis should be pointing offset in degrees from the source 
-    - radial distance
-    - az
-    - alt
-    y-axis is the temperature in K
-    bin this into a histogram with bin size of 0.1 deg
-    fit a gaussian to the histogram and 
-    that should give us the beam (full beam of the feed+dish)
-    use that beam size to do the convolution with the beam map
-    '''
+        plt.show()
+        plt.close()
