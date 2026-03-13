@@ -322,8 +322,8 @@ def plot_waterwall_with_pointing(
         el = data.el
 
     # Prefer mean/std from match_data_and_pointing when available
-    spec_mean = getattr(data, "calibrated_spec_mean", None) or getattr(data, "spec_mean", None)
-    spec_std = getattr(data, "calibrated_spec_std", None) or getattr(data, "spec_std", None)
+    spec_mean = io.get_pol_source(data, kind="mean")
+    spec_std = io.get_pol_source(data, kind="std")
     if spec_mean is not None and spec_std is not None:
         source = spec_std if use_std else spec_mean
         plot_data = {name: getattr(source, name) for name in CAL_POL_NAMES if getattr(source, name, None) is not None}

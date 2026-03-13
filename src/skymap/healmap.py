@@ -8,10 +8,10 @@ from typing import TYPE_CHECKING, Literal
 
 import healpy as hp
 import matplotlib.pyplot as plt
-import matplotlib.text as mpltext
+import matplotlib.patches as mpatches
 import numpy as np
 
-from skymap.io import CAL_POL_NAMES
+from skymap.io import get_available_pol_names, get_pol_source
 
 if TYPE_CHECKING:
     from skymap.io import PointingData
@@ -24,58 +24,6 @@ BEAM_AREA_SQ_DEG = 1.0
 BEAM_RADIUS_DEG = np.sqrt(BEAM_AREA_SQ_DEG / np.pi)
 
 
-def _beam_circle_thetaphi_rad(
-    center_ra_deg: float, center_dec_deg: float, npoints: int = 64
-) -> tuple[np.ndarray, np.ndarray]:
-    """Return (theta, phi) in radians for a circle of angular radius BEAM_RADIUS_DEG.
-
-    Exact calculation:
-    1. Beam area = BEAM_AREA_SQ_DEG (1 sq.deg) -> radius = sqrt(area/pi) = BEAM_RADIUS_DEG deg.
-    2. radius_rad = np.radians(BEAM_RADIUS_DEG) so angular radius is exactly BEAM_RADIUS_DEG.
-    3. Center in healpy (theta, phi): theta = colatitude = pi/2 - dec, phi = ra (radians).
-    4. Small circle (constant angular distance): theta = theta0 + radius_rad*cos(t),
-       phi = phi0 + radius_rad*sin(t)/sin(theta0).
-    Returns (theta, phi) in radians for use with projplot(..., lonlat=False).
-    """
-    radius_rad = np.radians(BEAM_RADIUS_DEG)
-    ra_rad = np.radians(center_ra_deg)
-    dec_rad = np.radians(center_dec_deg)
-    theta0 = np.pi / 2.0 - dec_rad
-    phi0 = ra_rad
-    t = np.linspace(0, 2 * np.pi, npoints, endpoint=False)
-    theta = theta0 + radius_rad * np.cos(t)
-    phi = phi0 + radius_rad * np.sin(t) / np.sin(theta0)
-    return theta, phi
-
-
-def _beam_circle_radec_deg(center_ra_deg: float, center_dec_deg: float, npoints: int = 64) -> tuple[np.ndarray, np.ndarray]:
-    """Return (ra, dec) in degrees for a circle of angular radius BEAM_RADIUS_DEG (for RA/Dec axes plot)."""
-    t = np.linspace(0, 2 * np.pi, npoints, endpoint=False)
-    dec_rad = np.radians(center_dec_deg)
-    ra_circle = center_ra_deg + (BEAM_RADIUS_DEG / np.cos(dec_rad)) * np.cos(t)
-    dec_circle = center_dec_deg + BEAM_RADIUS_DEG * np.sin(t)
-    return ra_circle, dec_circle
-
-
-def _add_beam_indicator(region: tuple[float, float, float] | None) -> None:
-    """Draw a circle showing the beam size (BEAM_AREA_SQ_DEG, radius BEAM_RADIUS_DEG).
-    Circle angular size is always BEAM_RADIUS_DEG; position is chosen to lie within the plot region.
-    Uses current axes (after mollview/gnomview)."""
-    if region is not None:
-        center_ra, center_dec, area_sqdeg = region
-        extent_deg = np.sqrt(float(area_sqdeg))
-        margin_deg = min(0.1, extent_deg / 8)
-        inset = BEAM_RADIUS_DEG + margin_deg
-        beam_ra = center_ra - extent_deg / 2 + inset
-        beam_dec = center_dec - extent_deg / 2 + inset
-    else:
-        beam_ra, beam_dec = 260.0, -70.0
-    theta, phi = _beam_circle_thetaphi_rad(beam_ra, beam_dec)
-    try:
-        hp.projplot(theta, phi, "k-", lonlat=False, lw=1.5)
-    except Exception:
-        pass
-
 
 def _add_beam_indicator_radec(ax, region: tuple[float, float, float]) -> None:
     """Draw beam circle on axes where x=RA, y=Dec (data coordinates)."""
@@ -85,8 +33,10 @@ def _add_beam_indicator_radec(ax, region: tuple[float, float, float]) -> None:
     inset = BEAM_RADIUS_DEG + margin_deg
     beam_ra = center_ra - extent_deg / 2 + inset
     beam_dec = center_dec - extent_deg / 2 + inset
-    ra_c, dec_c = _beam_circle_radec_deg(beam_ra, beam_dec)
-    ax.plot(ra_c, dec_c, "k-", lw=1.5)
+    circle = mpatches.Circle(
+        (beam_ra, beam_dec), BEAM_RADIUS_DEG, fill=False, edgecolor="k", lw=1.5
+    )
+    ax.add_patch(circle)
 
 
 def _apply_axes_kwargs(ax, kwargs: dict) -> None:
@@ -103,30 +53,6 @@ def _apply_axes_kwargs(ax, kwargs: dict) -> None:
             ax.set(**kwargs)
         except (TypeError, AttributeError):
             pass
-
-
-def _set_plot_labels_and_cbar_style() -> None:
-    """
-    Healpy uses axis('off') so set_xlabel/set_ylabel are hidden; we use text annotations instead."""
-    ax = plt.gca()
-    # Place "RA" and "Dec" as text (axis is off in healpy projection axes)
-    ax.text(0.5, -0.06, "RA", transform=ax.transAxes, ha="center", va="top", fontsize=10)
-    ax.text(-0.06, 0.5, "Dec", transform=ax.transAxes, ha="right", va="center", rotation=90, fontsize=10)
-    fig = plt.gcf()
-
-
-
-def _get_pol_source(data: PointingData | object) -> object | None:
-    """Return calibrated_spec_mean or spec_mean if present, else None."""
-    return getattr(data, "calibrated_spec_mean", None) or getattr(data, "spec_mean", None)
-
-
-def _get_available_pol_names(data: object) -> list[str]:
-    """Return pol channel names that exist and have data on the given object."""
-    source = _get_pol_source(data)
-    if source is None:
-        return []
-    return [n for n in CAL_POL_NAMES if hasattr(source, n) and getattr(source, n) is not None]
 
 
 class HealPixMap:
@@ -258,14 +184,14 @@ class HealPixMap:
         if ra.size != dec.size:
             raise ValueError("pointing_data must have ra and dec of the same length")
 
-        spec_source = _get_pol_source(pointing_data)
+        spec_source = get_pol_source(pointing_data, kind="mean")
         if spec_source is None:
             self.fill_from_pointing(ra, dec)
             self._channel_maps.clear()
             self._channel_stds.clear()
             return
 
-        available = _get_available_pol_names(pointing_data)
+        available = get_available_pol_names(pointing_data, kind="mean")
         if not available:
             self.fill_from_pointing(ra, dec)
             self._channel_maps.clear()
@@ -322,8 +248,8 @@ class HealPixMap:
         ra_dec_map: bool = False,
         **kwargs,
     ) -> None:
-        """Plot a single map: if ra_dec_map=True (and region given) use RA/Dec axes; else regular healpy (mollview or gnomview).
-        Extra kwargs (e.g. clim, xlabel, ylabel) are applied to the plot/axes."""
+        """Plot a single map: if ra_dec_map=True (and region given) use RA/Dec axes; else full-sky mollview.
+        When region is specified, ra_dec_map must be True. Extra kwargs (e.g. clim, xlabel, ylabel) are applied to the plot/axes."""
         kwargs = dict(kwargs)  # don't mutate caller's dict when used for multiple subplots
         to_plot = np.asarray(map_array, dtype=float).copy()
         to_plot[np.isnan(to_plot)] = hp.UNSEEN
@@ -338,6 +264,8 @@ class HealPixMap:
         if plot_title is not None:
             title = plot_title
 
+        if region is not None and not ra_dec_map:
+            raise ValueError("When a region is specified, ra_dec_map must be True")
         if ra_dec_map:
             if region is None:
                 raise ValueError("region is required when ra_dec_map=True")
@@ -376,35 +304,15 @@ class HealPixMap:
             _apply_axes_kwargs(ax, kwargs)
             return
 
-        # Regular healpy plot: mollview (full sky) or gnomview (region)
+        # Regular healpy plot: mollview (full sky)
         hp_kw = dict(title=title, unit=unit, cbar=True, cmap=cmap)
         if clim is not None:
             hp_kw["min"] = clim[0]
             hp_kw["max"] = clim[1]
         if sub is not None:
             hp_kw["sub"] = sub
-        if region is None:
-            hp.mollview(to_plot, **hp_kw)
-        else:
-            center_ra, center_dec, area_sqdeg = region
-            extent_deg = np.sqrt(float(area_sqdeg))
-            reso_arcmin = max(0.5, extent_deg * 60 / 256)
-            xsize = max(64, int(extent_deg * 60 / reso_arcmin))
-            hp.gnomview(
-                to_plot,
-                rot=(center_ra, center_dec),
-                reso=reso_arcmin,
-                xsize=xsize,
-                **hp_kw,
-            )
-        _set_plot_labels_and_cbar_style()
-        if show_beam:
-            _add_beam_indicator(region)
+        hp.mollview(to_plot, **hp_kw)
         ax = plt.gca()
-        if xlabel is not None:
-            ax.set_xlabel(xlabel)
-        if ylabel is not None:
-            ax.set_ylabel(ylabel)
         _apply_axes_kwargs(ax, kwargs)
 
     def _cbar_label(self, attribute: str | None, stat: Literal["mean", "std"]) -> str:
@@ -432,8 +340,8 @@ class HealPixMap:
         Plot the map.
 
         If ra_dec_map=True (and region given): plot with RA and Dec as X/Y axes using
-        healpix pixels in the region (query_disc + pix2ang). Otherwise: regular healpy
-        plot (mollview for full sky, gnomview when region is given).
+        healpix pixels in the region (query_disc + pix2ang). Otherwise: full-sky mollview.
+        When region is specified, ra_dec_map must be True.
 
         Parameters
         ----------
@@ -455,8 +363,8 @@ class HealPixMap:
         show : bool, optional
             If True (default), call plt.show() after drawing.
         region : tuple (center_ra, center_dec, area_sqdeg) or None, optional
-            Patch to plot. Required when ra_dec_map=True. When ra_dec_map=False and
-            region is given, gnomview is used; when None, mollview (full sky).
+            Patch to plot. Required when ra_dec_map=True. When region is given,
+            ra_dec_map must be True. When None and ra_dec_map=False, mollview (full sky) is used.
         show_beam : bool, optional
             If True (default), draw the 1 sq.deg beam circle.
         ra_dec_map : bool, optional
