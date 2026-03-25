@@ -25,17 +25,23 @@ BEAM_RADIUS_DEG = np.sqrt(BEAM_AREA_SQ_DEG / np.pi)
 
 
 
-def _add_beam_indicator_radec(ax, region: tuple[float, float, float]) -> None:
-    """Draw beam circle on axes where x=RA, y=Dec (data coordinates)."""
+def _add_beam_indicator_radec(
+    ax,
+    region: tuple[float, float, float],
+    beam_radius_deg: float | None = None,
+) -> None:
+    """Draw beam circle on axes where x=RA, y=Dec (data coordinates).
+
+    If ``beam_radius_deg`` is None, use the nominal 1 sq.deg beam radius.
+    """
+    radius = float(beam_radius_deg) if beam_radius_deg is not None else float(BEAM_RADIUS_DEG)
     center_ra, center_dec, area_sqdeg = region
     extent_deg = np.sqrt(float(area_sqdeg))
     margin_deg = min(0.1, extent_deg / 8)
-    inset = BEAM_RADIUS_DEG + margin_deg
+    inset = radius + margin_deg
     beam_ra = center_ra - extent_deg / 2 + inset
     beam_dec = center_dec - extent_deg / 2 + inset
-    circle = mpatches.Circle(
-        (beam_ra, beam_dec), BEAM_RADIUS_DEG, fill=False, edgecolor="k", lw=1.5
-    )
+    circle = mpatches.Circle((beam_ra, beam_dec), radius, fill=False, edgecolor="k", lw=1.5)
     ax.add_patch(circle)
 
 
@@ -281,6 +287,7 @@ class HealPixMap:
         region: tuple[float, float, float] | None = None,
         sub: tuple[int, int, int] | None = None,
         ra_dec_map: bool = False,
+        beam_radius_deg: float | None = None,
         **kwargs,
     ) -> None:
         """Plot a single map: if ra_dec_map=True (and region given) use RA/Dec axes; else full-sky mollview.
@@ -333,7 +340,7 @@ class HealPixMap:
             ax.set_title(title or "")
             cb = plt.colorbar(sc, ax=ax)
             cb.set_label(unit or "", fontweight="normal")
-            _add_beam_indicator_radec(ax, region)
+            _add_beam_indicator_radec(ax, region, beam_radius_deg=beam_radius_deg)
             _apply_axes_kwargs(ax, kwargs)
             return
 
@@ -357,17 +364,22 @@ class HealPixMap:
         mask_uncovered: bool = True,
         region: tuple[float, float, float] | None = None,
         ra_dec_map: bool = False,
+        beam_radius_deg: float | None = None,
         **kwargs,
     ) -> None:
         """
         Plot the map.
 
         If ra_dec_map=True (and region given): plot with RA and Dec as X/Y axes using
-        healpix pixels in the region (query_disc + pix2ang); beam circle is drawn automatically.
+        healpix pixels in the region (query_disc + pix2ang); a beam circle is drawn
+        in the corner (see ``beam_radius_deg``).
         Otherwise: full-sky mollview. When region is specified, ra_dec_map must be True.
 
         Parameters
         ----------
+        beam_radius_deg : float or None, optional
+            Radius of the beam circle indicator in degrees. If None (default), uses
+            the nominal map-making beam (1 sq.deg). 
         attribute : str or None, optional
             PolChannel name to plot (e.g. 'AA_', 'BB_'). If None and channel maps exist,
             plot all channels in a subplot grid; if None and no channel maps, plot the
@@ -414,6 +426,7 @@ class HealPixMap:
                 mask_uncovered=mask_uncovered,
                 region=region,
                 ra_dec_map=ra_dec_map,
+                beam_radius_deg=beam_radius_deg,
                 **{**plot_kw, "title": plot_kw.get("title", attribute)},
             )
             plt.show()
@@ -436,6 +449,7 @@ class HealPixMap:
                     region=region,
                     sub=(nrow, ncol, i + 1),
                     ra_dec_map=ra_dec_map,
+                    beam_radius_deg=beam_radius_deg,
                     **{**plot_kw, "title": name},
                 )
             plt.tight_layout()
@@ -451,6 +465,7 @@ class HealPixMap:
             mask_uncovered=mask_uncovered,
             region=region,
             ra_dec_map=ra_dec_map,
+            beam_radius_deg=beam_radius_deg,
             **plot_kw,
         )
         plt.show()

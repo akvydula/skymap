@@ -11,14 +11,13 @@ Beam estimation for 310 MHz observations
 from __future__ import annotations
 
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import healpy as hp
 import matplotlib.pyplot as plt
 import numpy as np
-
-if TYPE_CHECKING:
-    from skymap.healmap import HealPixMap
+from scipy.optimize import curve_fit
+from skymap.healmap import HealPixMap
 
 # Default catalogue next to this module
 _CALIBRATORS_PATH = Path(__file__).resolve().parent / "calibrators.dat"
@@ -86,446 +85,369 @@ def get_source_radec(source_name: str, path: Path | str | None = None) -> tuple[
     raise KeyError(f"Source {source_name!r} not found in calibrators. Known: {[n for n, _, _ in catalog]}")
 
 
-def radial_offset_histogram(
-    healmap: HealPixMap,
-    source_ra_deg: float,
-    source_dec_deg: float,
-    attribute: str | None = None,
-    bin_size_deg: float = 0.1,
-    max_offset_deg: float | None = None,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Compute a radial profile from a HealPixMap: for each pixel with valid mean,
-    compute angular offset (deg) from the source (RA, Dec), then bin by offset
-    and average the mean (K) in each bin.
-
-    Parameters
-    ----------
-    healmap : HealPixMap
-        Map filled with mean in K (e.g. from fill_from_pointing_data).
-    source_ra_deg, source_dec_deg : float
-        Source position in degrees (e.g. from get_source_radec).
-    attribute : str or None
-        PolChannel to use (e.g. 'AA_', 'BB_'). If None and map has no channel
-        maps, the main map is used; if channel maps exist, one must be specified.
-    bin_size_deg : float
-        Bin width for radial offset in degrees (default 0.1).
-    max_offset_deg : float or None
-        If set, only include pixels with offset <= this (degrees).
-
-    Returns
-    -------
-    bin_centers : np.ndarray
-        Radial offset in degrees (bin centers).
-    mean_k : np.ndarray
-        Mean temperature in K in each radial bin.
-    counts : np.ndarray
-        Number of pixels in each bin.
-    """
-    nside = healmap.nside
-    npix = healmap.npix
-    map_vals = healmap.get_map(attribute)
-    hit_count = healmap.get_hit_count()
-
-    # Pixels with at least one hit and finite mean
-    valid = (hit_count > 0) & np.isfinite(map_vals)
-    ipix = np.where(valid)[0]
-    if ipix.size == 0:
-        return np.array([]), np.array([]), np.array([])
-
-    # Angular distance from source (degrees)
-    vec_src = hp.ang2vec(
-        np.radians(90.0 - source_dec_deg),
-        np.radians(source_ra_deg),
-    )
-    thetas, phis = hp.pix2ang(nside, ipix)
-    vecs = hp.ang2vec(thetas, phis)
-    offset_rad = hp.rotator.angdist(vec_src, vecs)
-    offset_deg = np.degrees(offset_rad)
-    values = np.asarray(map_vals[ipix], dtype=float)
-
-    if max_offset_deg is not None:
-        mask = offset_deg <= max_offset_deg
-        offset_deg = offset_deg[mask]
-        values = values[mask]
-
-    # Bin by offset_deg
-    max_off = float(np.max(offset_deg)) if offset_deg.size else 0.0
-    n_bins = max(1, int(np.ceil(max_off / bin_size_deg)))
-    bin_edges = np.linspace(0, n_bins * bin_size_deg, n_bins + 1)
-    bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2.0
-    mean_k = np.full(n_bins, np.nan, dtype=float)
-    counts = np.zeros(n_bins, dtype=int)
-
-    for i in range(n_bins):
-        lo, hi = bin_edges[i], bin_edges[i + 1]
-        in_bin = (offset_deg >= lo) & (offset_deg < hi)
-        if np.any(in_bin):
-            mean_k[i] = np.nanmean(values[in_bin])
-            counts[i] = int(np.sum(in_bin))
-
-    return bin_centers, mean_k, counts
-
-
-def radial_offset_histogram_from_arrays(
-    ra_deg: np.ndarray,
-    dec_deg: np.ndarray,
-    values: np.ndarray,
-    source_ra_deg: float,
-    source_dec_deg: float,
-    bin_size_deg: float = 0.1,
-    max_offset_deg: float | None = None,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Compute the radial histogram from pre-extracted (ra, dec, values), e.g. from
-    HealPixMap.get_map_radec_values(). x-axis = radial offset (deg) from source,
-    y-axis = mean value (K) per bin.
-
-    Parameters
-    ----------
-    ra_deg, dec_deg : np.ndarray
-        RA and Dec in degrees for each point (same length).
-    values : np.ndarray
-        Value (e.g. mean in K) for each point.
-    source_ra_deg, source_dec_deg : float
-        Source position in degrees.
-    bin_size_deg : float
-        Bin width for radial offset (default 0.1).
-    max_offset_deg : float or None
-        If set, only include points with offset <= this (degrees).
-
-    Returns
-    -------
-    bin_centers : np.ndarray
-        Radial offset in degrees (bin centers).
-    mean_k : np.ndarray
-        Mean value in each radial bin.
-    counts : np.ndarray
-        Number of points per bin.
-    """
-    ra_deg = np.atleast_1d(np.asarray(ra_deg, dtype=float))
-    dec_deg = np.atleast_1d(np.asarray(dec_deg, dtype=float))
-    values = np.atleast_1d(np.asarray(values, dtype=float))
-    if ra_deg.size != dec_deg.size or ra_deg.size != values.size:
-        raise ValueError("ra_deg, dec_deg, and values must have the same length")
-    if ra_deg.size == 0:
-        return np.array([]), np.array([]), np.array([])
-
-    vec_src = hp.ang2vec(
-        np.radians(90.0 - source_dec_deg),
-        np.radians(source_ra_deg),
-    )
-    thetas = np.radians(90.0 - dec_deg)
-    phis = np.radians(ra_deg)
-    vecs = hp.ang2vec(thetas, phis)
-    offset_rad = hp.rotator.angdist(vec_src, vecs)
-    offset_deg = np.degrees(offset_rad)
-
-    if max_offset_deg is not None:
-        mask = offset_deg <= max_offset_deg
-        offset_deg = offset_deg[mask]
-        values = values[mask]
-
-    if offset_deg.size == 0:
-        return np.array([]), np.array([]), np.array([])
-
-    max_off = float(np.max(offset_deg))
-    n_bins = max(1, int(np.ceil(max_off / bin_size_deg)))
-    bin_edges = np.linspace(0, n_bins * bin_size_deg, n_bins + 1)
-    bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2.0
-    mean_k = np.full(n_bins, np.nan, dtype=float)
-    counts = np.zeros(n_bins, dtype=int)
-
-    for i in range(n_bins):
-        lo, hi = bin_edges[i], bin_edges[i + 1]
-        in_bin = (offset_deg >= lo) & (offset_deg < hi)
-        if np.any(in_bin):
-            mean_k[i] = np.nanmean(values[in_bin])
-            counts[i] = int(np.sum(in_bin))
-
-    return bin_centers, mean_k, counts
-
-
-def compute_beam_histogram_from_arrays(
-    ra_deg: np.ndarray,
-    dec_deg: np.ndarray,
-    values: np.ndarray,
+def compute_beam_histogram(
+    healmap_or_ra_deg: HealPixMap | np.ndarray,
+    dec_deg: np.ndarray | None = None,
+    values: np.ndarray | None = None,
     source_name: str | None = None,
     source_ra_deg: float | None = None,
     source_dec_deg: float | None = None,
+    attribute: str | None = None,
     bin_size_deg: float = 0.1,
     calibrators_path: Path | str | None = None,
     max_offset_deg: float | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    Compute the radial beam histogram from pre-extracted map data (e.g. from
-    HealPixMap.get_map_radec_values()). Source position is either from
-    source_name (calibrators.dat) or from (source_ra_deg, source_dec_deg).
+    Beam histogram: x=radial pointing offset (deg), y=mean(values) per bin.
 
-    Parameters
-    ----------
-    ra_deg, dec_deg, values : np.ndarray
-        Map data as returned by healmap.get_map_radec_values(attribute).
-    source_name : str or None
-        Calibrator name to look up (e.g. '3C286'). Ignored if source_ra_deg/source_dec_deg given.
-    source_ra_deg, source_dec_deg : float or None
-        Source position in degrees. If both given, used instead of source_name.
-    bin_size_deg : float
-        Bin width in degrees (default 0.1).
-    calibrators_path : path or None
-        Path to calibrator catalogue when using source_name.
-    max_offset_deg : float or None
-        If set, only include points within this radius (deg).
+    Pass either:
+    - a `HealPixMap` as first arg (set `attribute` if needed), OR
+    - arrays: (ra_deg, dec_deg, values).
 
-    Returns
-    -------
-    bin_centers, mean_k, counts
-        Same as radial_offset_histogram_from_arrays.
+    Source is specified by either `source_name` (looked up in calibrators.dat)
+    or explicit `source_ra_deg` + `source_dec_deg`.
     """
+    # Input normalization: HealPixMap or arrays
+    if hasattr(healmap_or_ra_deg, "get_map_radec_values"):
+        healmap = healmap_or_ra_deg  # type: ignore[assignment]
+        ra_deg, dec_deg2, values2 = healmap.get_map_radec_values(attribute)
+    else:
+        ra_deg = np.asarray(healmap_or_ra_deg)  # type: ignore[assignment]
+        if dec_deg is None or values is None:
+            raise ValueError("When passing arrays, provide dec_deg and values")
+        dec_deg2 = dec_deg
+        values2 = values
+
     if source_ra_deg is not None and source_dec_deg is not None:
         src_ra, src_dec = source_ra_deg, source_dec_deg
     elif source_name is not None:
         src_ra, src_dec = get_source_radec(source_name, path=calibrators_path)
     else:
         raise ValueError("Provide either source_name or (source_ra_deg, source_dec_deg)")
-    return radial_offset_histogram_from_arrays(
-        ra_deg,
-        dec_deg,
-        values,
-        src_ra,
-        src_dec,
-        bin_size_deg=bin_size_deg,
-        max_offset_deg=max_offset_deg,
-    )
+
+    ra_deg = np.atleast_1d(np.asarray(ra_deg, dtype=float))
+    dec_deg2 = np.atleast_1d(np.asarray(dec_deg2, dtype=float))
+    values2 = np.atleast_1d(np.asarray(values2, dtype=float))
+    if ra_deg.size != dec_deg2.size or ra_deg.size != values2.size:
+        raise ValueError("ra_deg, dec_deg, and values must have the same length")
+    if ra_deg.size == 0:
+        return np.array([]), np.array([]), np.array([])
+
+    # Flat-sky approximation (treat RA/Dec as Cartesian axes in degrees).
+    # Use shortest RA separation to avoid 0/360 wrap artifacts.
+    dra = ((ra_deg - float(src_ra) + 180.0) % 360.0) - 180.0
+    ddec = dec_deg2 - float(src_dec)
+    offset_deg = np.sqrt(dra * dra + ddec * ddec)
+
+    if max_offset_deg is not None:
+        mask = offset_deg <= max_offset_deg
+        offset_deg = offset_deg[mask]
+        values2 = values2[mask]
+
+    if offset_deg.size == 0:
+        return np.array([]), np.array([]), np.array([])
+
+    max_off = float(np.max(offset_deg))
+    bin_edges = np.arange(0, max_off + bin_size_deg, bin_size_deg)
+    bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
+    n_bins = len(bin_centers)
+
+    # Assign bins
+    bin_idx = np.digitize(offset_deg, bin_edges) - 1
+    bin_idx[bin_idx == n_bins] = n_bins - 1
+
+    mean_k = np.full(n_bins, np.nan)
+    counts = np.zeros(n_bins, dtype=int)
+
+    for i in range(n_bins):
+        mask = bin_idx == i
+        if np.any(mask):
+            mean_k[i] = np.nanmean(values2[mask])
+            counts[i] = mask.sum()
+
+    return bin_centers, mean_k, counts
 
 
-def compute_beam_histogram(
-    healmap: HealPixMap,
-    source_name: str,
-    attribute: str | None = None,
-    bin_size_deg: float = 0.1,
-    calibrators_path: Path | str | None = None,
-    max_offset_deg: float | None = None,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Convenience: get source RA/Dec from calibrators.dat, then compute
-    radial offset histogram (x = offset deg, y = mean K).
-
-    Returns
-    -------
-    bin_centers, mean_k, counts
-        Same as radial_offset_histogram.
-    """
-    ra_deg, dec_deg = get_source_radec(source_name, path=calibrators_path)
-    return radial_offset_histogram(
-        healmap,
-        ra_deg,
-        dec_deg,
-        attribute=attribute,
-        bin_size_deg=bin_size_deg,
-        max_offset_deg=max_offset_deg,
-    )
 
 
-def plot_radial_histogram(
-    bin_centers: np.ndarray,
-    mean_k: np.ndarray,
-    counts: np.ndarray | None = None,
+def _normalize_ra_deg(ra: np.ndarray) -> np.ndarray:
+    """Put RA in [0, 360) to avoid -180/360 wrap issues."""
+    ra = np.asarray(ra, dtype=float)
+    return ra % 360.0
+
+
+def plot_offset_map(
+    ra_deg: np.ndarray,
+    dec_deg: np.ndarray,
+    offset_deg: np.ndarray | None = None,
     *,
-    title: str | None = "Radial profile",
-    xlabel: str = "Radial offset (deg)",
-    ylabel: str = "Mean (K)",
-    mask_nan: bool = True,
+    source_ra_deg: float | None = None,
+    source_dec_deg: float | None = None,
+    relative_frame: bool = False,
+    resolution_deg: float = 0.1,
     ax: Any = None,
+    xlabel: str = "RA (deg)",
+    ylabel: str = "Dec (deg)",
+    cbar_label: str = "Radial offset from source (deg)",
+    mark_source: bool = True,
     show: bool = True,
     **kwargs: Any,
 ) -> Any:
     """
-    Plot the radial histogram: x = radial offset (deg), y = mean temperature (K).
+    Plot offset from source as color on RA/Dec: x=RA, y=Dec, color=offset_deg.
+    All RA/Dec in degrees (RA 0--360 or -180--180; Dec -90--90). RA is normalized
+    to [0, 360) so offset is consistent.
 
-    Parameters
-    ----------
-    bin_centers : np.ndarray
-        Radial offset bin centers in degrees.
-    mean_k : np.ndarray
-        Mean temperature in K per bin.
-    counts : np.ndarray or None
-        Optional pixel count per bin (not plotted by default).
-    title : str or None
-        Axes title.
-    xlabel, ylabel : str
-        Axis labels.
-    mask_nan : bool
-        If True (default), skip bins with NaN mean when drawing the histogram.
-    ax : matplotlib axes or None
-        If given, plot into this axes; otherwise create a new figure.
-    show : bool
-        If True (default), call plt.show().
-    **kwargs
-        Passed to plt.hist() (e.g. color, edgecolor, label, alpha).
-
-    Returns
-    -------
-    ax
-        The matplotlib axes used.
+    If `source_ra_deg` and `source_dec_deg` are provided, the offset is always
+    computed from the source (so the color is guaranteed to represent radial
+    offset, even if a caller accidentally passes some other array as offset_deg).
     """
+    ra_deg = np.atleast_1d(np.asarray(ra_deg, dtype=float))
+    dec_deg = np.atleast_1d(np.asarray(dec_deg, dtype=float))
+    # Normalize RA to [0, 360) so angular distance and grid are consistent
+    ra_deg = _normalize_ra_deg(ra_deg)
+    src_ra = _normalize_ra_deg(np.array([float(source_ra_deg)]))[0] if source_ra_deg is not None else None
+    src_dec = float(source_dec_deg) if source_dec_deg is not None else None
+    if src_ra is not None and src_dec is not None:
+        # Flat-sky offset to match compute_beam_histogram
+        dra = ((ra_deg - src_ra + 180.0) % 360.0) - 180.0
+        ddec = dec_deg - src_dec
+        offset_deg = np.sqrt(dra * dra + ddec * ddec)
+    else:
+        if offset_deg is None:
+            raise ValueError("Provide offset_deg or (source_ra_deg, source_dec_deg)")
+        offset_deg = np.atleast_1d(np.asarray(offset_deg, dtype=float))
+    if ra_deg.size != dec_deg.size or ra_deg.size != offset_deg.size:
+        raise ValueError("ra_deg, dec_deg, offset_deg must have the same length")
+    if ra_deg.size == 0:
+        if ax is None:
+            ax = plt.gca()
+        return ax
+
+    # Choose plotting coordinates:
+    # - absolute frame: x=RA, y=Dec
+    # - relative frame: x=ΔRA, y=ΔDec with the source at (0,0) (matches plot_relative_frame)
+    if relative_frame:
+        if src_ra is None or src_dec is None:
+            raise ValueError("relative_frame=True requires source_ra_deg and source_dec_deg")
+        x = ((ra_deg - src_ra + 180.0) % 360.0) - 180.0
+        y = dec_deg - src_dec
+        x_label = "ΔRA (deg)"
+        y_label = "ΔDec (deg)"
+        mark_x, mark_y = 0.0, 0.0
+    else:
+        x = ra_deg
+        y = dec_deg
+        x_label = xlabel
+        y_label = ylabel
+        mark_x, mark_y = (src_ra, src_dec) if (src_ra is not None and src_dec is not None) else (None, None)
+
+    x_min, x_max = float(np.nanmin(x)), float(np.nanmax(x))
+    y_min, y_max = float(np.nanmin(y)), float(np.nanmax(y))
+    x_edges = np.arange(x_min, x_max + resolution_deg * 0.5, resolution_deg)
+    y_edges = np.arange(y_min, y_max + resolution_deg * 0.5, resolution_deg)
+    if x_edges.size < 2 or y_edges.size < 2:
+        x_edges = np.linspace(x_min, x_max, max(2, int((x_max - x_min) / resolution_deg) + 1))
+        y_edges = np.linspace(y_min, y_max, max(2, int((y_max - y_min) / resolution_deg) + 1))
+
+    j = np.clip(np.searchsorted(x_edges, x, side="right") - 1, 0, len(x_edges) - 2)
+    i = np.clip(np.searchsorted(y_edges, y, side="right") - 1, 0, len(y_edges) - 2)
+    n_y, n_x = len(y_edges) - 1, len(x_edges) - 1
+    sum_off = np.full((n_y, n_x), 0.0)
+    count = np.zeros((n_y, n_x), dtype=float)
+    np.add.at(sum_off, (i, j), offset_deg)
+    np.add.at(count, (i, j), 1.0)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        Z = np.where(count > 0, sum_off / count, np.nan)
+
     if ax is None:
         fig, ax = plt.subplots()
-    if len(bin_centers) == 0:
-        ax.set_xlabel(xlabel)
-        ax.set_ylabel(ylabel)
-        if title is not None:
-            ax.set_title(title)
-        ax.grid(True, alpha=0.3)
-        if show:
-            plt.show()
-        return ax
-    if mask_nan:
-        valid = np.isfinite(mean_k)
-        x, w = bin_centers[valid], mean_k[valid]
-    else:
-        x, w = bin_centers, mean_k
-    # Reconstruct bin edges (uniform spacing) for plt.hist
-    if len(bin_centers) > 1:
-        width = float(bin_centers[1] - bin_centers[0])
-    else:
-        width = 0.1
-    bin_edges = np.concatenate(
-        [[bin_centers[0] - width / 2], bin_centers + width / 2]
-    )
-    ax.hist(x, bins=bin_edges, weights=w, **kwargs)
-    ax.set_xlabel(xlabel)
-    ax.set_ylabel(ylabel)
-    if title is not None:
-        ax.set_title(title)
-    ax.grid(True, alpha=0.3)
+    pc = ax.pcolormesh(x_edges, y_edges, Z, **kwargs)
+    ax.set_xlabel(x_label)
+    ax.set_ylabel(y_label)
+    ax.set_aspect("equal")
+    if mark_source and mark_x is not None and mark_y is not None:
+        ax.plot(mark_x, mark_y, "k*", ms=12, label="Source")
+    cb = plt.colorbar(pc, ax=ax)
+    cb.set_label(cbar_label)
     if show:
         plt.show()
     return ax
 
 
-def plot_beam_histogram(
-    healmap: HealPixMap,
-    source_name: str,
-    attribute: str | None = None,
-    bin_size_deg: float = 0.1,
-    calibrators_path: Path | str | None = None,
-    max_offset_deg: float | None = None,
-    title: str | None = None,
+def _gaussian_peak(theta: np.ndarray, A: float, sigma: float) -> np.ndarray:
+    """Gaussian bump only (no constant): peak A at theta=0."""
+    return A * np.exp(-(theta**2) / (2.0 * sigma**2))
+
+
+def plot_beam_gaussian(
+    bin_centers: np.ndarray,
+    mean_vals: np.ndarray,
+    counts: np.ndarray | None = None,
+    *,
+    baseline_k: float | None = None,
     ax: Any = None,
     show: bool = True,
-    **plot_kwargs: Any,
-) -> Any:
+    title: str = "Beam profile",
+) -> dict[str, Any]:
     """
-    Compute the radial beam histogram (source from calibrators.dat) and plot it.
+    Fit a Gaussian bump to radial-offset bins vs mean (K), always relative to the
+    mean of ``mean_vals``: fit ``A*exp(-x**2/(2*sigma**2))`` to ``mean_k - mean(mean_k)``,
+    then plot ``bump + baseline``.
+
+    Parameters
+    ----------
+    baseline_k : float or None
+        If set, use this as the baseline instead of ``mean(mean_vals)``.
+    """
+    mask = np.isfinite(mean_vals) & np.isfinite(bin_centers)
+    x = np.asarray(bin_centers[mask], dtype=float)
+    y = np.asarray(mean_vals[mask], dtype=float)
+
+    if x.size < 5:
+        raise ValueError("Not enough valid data points to fit")
+
+    if counts is not None:
+        c = np.asarray(counts[mask], dtype=float)
+        sigma_weights = 1.0 / np.sqrt(np.maximum(c, 0.0) + 1e-6)
+    else:
+        sigma_weights = None
+
+    x_fit = np.linspace(0.0, float(np.max(x)), 500)
+
+    baseline = float(baseline_k) if baseline_k is not None else float(np.nanmean(y))
+    y_rel = y - baseline
+    A0 = float(np.nanmax(y_rel) - np.nanmin(y_rel))
+    if A0 <= 0:
+        A0 = float(np.nanmax(y_rel))
+    sigma0 = max(float(x[np.argmax(y_rel)]) / 2.0, 1e-3)
+    p0 = [A0, sigma0]
+    popt, pcov = curve_fit(
+        _gaussian_peak,
+        x,
+        y_rel,
+        p0=p0,
+        sigma=sigma_weights,
+        absolute_sigma=False,
+        maxfev=10000,
+    )
+    A, sigma = float(popt[0]), float(popt[1])
+    y_fit = _gaussian_peak(x_fit, A, sigma) + baseline
+    baseline_used = baseline
+
+    fwhm = 2.355 * sigma
+
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(6, 4))
+    ax.scatter(x, y, s=10, label="Data (mean per pixel [K])")
+    ax.plot(
+        x_fit,
+        y_fit,
+        label=f"Gaussian fit \nσ={sigma:.3f}°, FWHM={fwhm:.3f}°",
+    )
+    ax.axhline(baseline_used, color="gray", ls="--", lw=1, alpha=0.7, label="Baseline")
+    ax.set_xlabel("Radial offset (deg)")
+    ax.set_ylabel("Mean (K)")
+    ax.set_title(title)
+    ax.legend()
+    ax.grid(alpha=0.3)
+    if show:
+        plt.show()
+
+    return {
+        "A": A,
+        "sigma_deg": sigma,
+        "FWHM_deg": fwhm,
+        "baseline_K": baseline_used,
+        "covariance": pcov,
+    }
+
+
+def convolve_beam_gaussian(
+    healmap: HealPixMap,
+    gaussian_params: dict[str, Any],
+    *,
+    attribute: str | None = None,
+    mask_uncovered: bool = True,
+) -> HealPixMap:
+    """
+    Smooth a healpix beam map with a Gaussian beam
+    Convolution is done with ``healpy.smoothing`` (Gaussian beam in harmonic
+    space, symmetric on the sphere).
 
     Parameters
     ----------
     healmap : HealPixMap
-        Map filled with mean in K.
-    source_name : str
-        Calibrator name (e.g. '3C286', '3C48').
+        Map with channel(s) to smooth
+    gaussian_params : dict
+        Must include ``FWHM_deg`` and/or ``sigma_deg`` (from ``plot_beam_gaussian``).
     attribute : str or None
-        PolChannel to use (e.g. 'AA_', 'BB_').
-    bin_size_deg : float
-        Bin width in degrees (default 0.1).
-    calibrators_path : path or None
-        Path to calibrator catalogue; default is calibrators.dat next to this module.
-    max_offset_deg : float or None
-        If set, only include pixels within this radius (deg).
-    title : str or None
-        Plot title; default is "{source_name} radial profile".
-    ax : matplotlib axes or None
-        If given, plot into this axes.
-    show : bool
-        If True (default), call plt.show().
-    **plot_kwargs
-        Passed to plot_radial_histogram / plt.hist().
+        Pol channel to smooth (e.g. ``\"AA_\"``). If ``None`` and there is
+        exactly one entry in ``_channel_maps``, that channel is used; if there
+        are multiple, you must pass ``attribute``.
+    mask_uncovered : bool
+        If True (default), pixels with no hits are set to ``UNSEEN`` before
+        smoothing, then restored to 0 so they stay masked in ``plot``.
 
     Returns
     -------
-    ax
-        The matplotlib axes used.
+    HealPixMap
+        New map with smoothed data; same ``nside`` and ``_hit_count`` as input.
+        Use ``.plot(attribute=..., ra_dec_map=True, region=...)`` as with the
+        original map.
     """
-    bin_centers, mean_k, counts = compute_beam_histogram(
-        healmap,
-        source_name,
-        attribute=attribute,
-        bin_size_deg=bin_size_deg,
-        calibrators_path=calibrators_path,
-        max_offset_deg=max_offset_deg,
-    )
-    if title is None:
-        title = f"{source_name} radial profile"
-    return plot_radial_histogram(
-        bin_centers,
-        mean_k,
-        counts,
-        title=title,
-        ax=ax,
-        show=show,
-        **plot_kwargs,
-    )
+    if "FWHM_deg" in gaussian_params:
+        fwhm_deg = float(gaussian_params["FWHM_deg"])
+    elif "sigma_deg" in gaussian_params:
+        fwhm_deg = 2.355 * float(gaussian_params["sigma_deg"])
+    else:
+        raise ValueError("gaussian_params must contain 'FWHM_deg' or 'sigma_deg'")
 
+    fwhm_rad = np.radians(fwhm_deg)
+    hit = np.asarray(healmap.get_hit_count(), dtype=float)
 
-def plot_beam_histogram_from_arrays(
-    ra_deg: np.ndarray,
-    dec_deg: np.ndarray,
-    values: np.ndarray,
-    source_name: str | None = None,
-    source_ra_deg: float | None = None,
-    source_dec_deg: float | None = None,
-    bin_size_deg: float = 0.1,
-    calibrators_path: Path | str | None = None,
-    max_offset_deg: float | None = None,
-    title: str | None = None,
-    ax: Any = None,
-    show: bool = True,
-    **plot_kwargs: Any,
-) -> Any:
-    """
-    Compute the radial beam histogram from pre-extracted map data and plot it.
-    Map data can be from HealPixMap.get_map_radec_values(attribute).
+    attrs: list[str]
+    if healmap._channel_maps:
+        if attribute is not None:
+            if attribute not in healmap._channel_maps:
+                raise KeyError(
+                    f"No map for {attribute!r}. Available: {list(healmap._channel_maps.keys())}"
+                )
+            attrs = [attribute]
+        elif len(healmap._channel_maps) == 1:
+            attrs = [next(iter(healmap._channel_maps.keys()))]
+        else:
+            raise ValueError(
+                "Several channel maps exist; pass attribute= e.g. 'AA_' or 'BB_'."
+            )
+    else:
+        if attribute is not None:
+            raise ValueError("No per-channel maps on healmap; attribute must be None")
+        attrs = []
 
-    Parameters
-    ----------
-    ra_deg, dec_deg, values : np.ndarray
-        Map data (e.g. from healmap.get_map_radec_values("AA_")).
-    source_name : str or None
-        Calibrator name (e.g. '3C286'). Ignored if source_ra_deg/source_dec_deg given.
-    source_ra_deg, source_dec_deg : float or None
-        Source position in degrees. If both given, used instead of source_name.
-    bin_size_deg, calibrators_path, max_offset_deg
-        Passed to compute_beam_histogram_from_arrays.
-    title : str or None
-        Plot title; default is "{source_name} radial profile" or "Radial profile".
-    ax, show, **plot_kwargs
-        Passed to plot_radial_histogram.
+    out = HealPixMap(healmap.nside)
+    out.map = hit.copy()
+    out._hit_count = hit.copy()
+    out._map_std = np.full(out.npix, np.nan, dtype=float)
 
-    Returns
-    -------
-    ax
-        The matplotlib axes used.
-    """
-    bin_centers, mean_k, counts = compute_beam_histogram_from_arrays(
-        ra_deg,
-        dec_deg,
-        values,
-        source_name=source_name,
-        source_ra_deg=source_ra_deg,
-        source_dec_deg=source_dec_deg,
-        bin_size_deg=bin_size_deg,
-        calibrators_path=calibrators_path,
-        max_offset_deg=max_offset_deg,
-    )
-    if title is None and source_name is not None:
-        title = f"{source_name} radial profile"
-    return plot_radial_histogram(
-        bin_centers,
-        mean_k,
-        counts,
-        title=title,
-        ax=ax,
-        show=show,
-        **plot_kwargs,
-    )
+    def _smooth_one(arr: np.ndarray) -> np.ndarray:
+        work = np.asarray(arr, dtype=float).copy()
+        if mask_uncovered:
+            work[hit <= 0] = hp.UNSEEN
+        sm = hp.smoothing(work, fwhm=fwhm_rad, verbose=False)
+        if mask_uncovered:
+            sm = np.asarray(sm, dtype=float)
+            sm[hit <= 0] = 0.0
+        return sm
+
+    if attrs:
+        for attr in attrs:
+            raw = healmap.get_map(attr)
+            out._channel_maps[attr] = _smooth_one(raw)
+            out._channel_stds[attr] = np.full(out.npix, np.nan, dtype=float)
+    else:
+        raw = healmap.get_map(None)
+        out.map = _smooth_one(raw)
+        out._map_std = np.full(out.npix, np.nan, dtype=float)
+
+    return out
