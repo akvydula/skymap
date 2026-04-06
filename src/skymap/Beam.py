@@ -15,6 +15,8 @@ from typing import Any
 
 import healpy as hp
 import matplotlib.pyplot as plt
+import warnings
+
 import numpy as np
 from scipy.optimize import curve_fit
 from skymap.healmap import HealPixMap
@@ -275,37 +277,327 @@ def plot_offset_map(
     return ax
 
 
-def _gaussian_peak(theta: np.ndarray, A: float, sigma: float) -> np.ndarray:
-    """Gaussian bump only (no constant): peak A at theta=0."""
-    return A * np.exp(-(theta**2) / (2.0 * sigma**2))
+def _gaussian_only(x: np.ndarray, A: float, sigma: float) -> np.ndarray:
+    return A * np.exp(-(x**2) / (2.0 * sigma**2))
 
 
-def plot_beam_gaussian(
+def _sigma_deg_from_beam_params(beam_params: dict[str, Any]) -> float:
+    """σ in degrees from fit dict (FWHM keys use FWHM → σ = FWHM / (2√(2 ln 2)))."""
+    _sqrt_2_ln2 = np.sqrt(2.0 * np.log(2.0))
+    if "FWHM_deg" in beam_params:
+        fwhm_deg = float(beam_params["FWHM_deg"])
+        if not np.isfinite(fwhm_deg) or fwhm_deg <= 0:
+            raise ValueError("FWHM_deg must be positive and finite")
+        return fwhm_deg / (2.0 * _sqrt_2_ln2)
+    if "half_power_radius_deg" in beam_params:
+        fwhm_deg = float(beam_params["half_power_radius_deg"])
+        if not np.isfinite(fwhm_deg) or fwhm_deg <= 0:
+            raise ValueError("half_power_radius_deg must be positive and finite")
+        return fwhm_deg / (2.0 * _sqrt_2_ln2)
+    if "sigma_deg" in beam_params:
+        sigma_deg = float(beam_params["sigma_deg"])
+        if not np.isfinite(sigma_deg) or sigma_deg <= 0:
+            raise ValueError("sigma_deg must be positive and finite")
+        return sigma_deg
+    raise ValueError(
+        "beam_params must include 'FWHM_deg', 'half_power_radius_deg' "
+        "(each interpreted as Gaussian FWHM in degrees), or 'sigma_deg'."
+    )
+
+
+def beam_approximation(
+    radial_offset_deg: np.ndarray,
+    beam_params: dict[str, Any],
+) -> np.ndarray:
+    """
+    Axisymmetric beam model used for convolution (radial offset in **degrees**).
+
+    - ``x ≤ r_poly_deg``: core Gaussian ``A exp(-x²/(2σ²))`` (same ``A``, ``σ`` as fit).
+    - ``x > r_poly_deg``: polynomial ``P(x)`` from ``poly_coeffs`` (low-to-high),
+      clipped to be non-negative for a physical beam response.
+
+    ``beam_params`` should be the return value of ``fit_beam_gaussian`` (needs
+    ``A``, ``poly_coeffs``, ``r_poly_deg``, and a width key).
+    """
+    if "A" not in beam_params:
+        raise ValueError("beam_params must include 'A' (output of fit_beam_gaussian).")
+    if "poly_coeffs" not in beam_params:
+        raise ValueError("beam_params must include 'poly_coeffs'.")
+    x = np.asarray(radial_offset_deg, dtype=float)
+    A = float(beam_params["A"])
+    sigma_deg = _sigma_deg_from_beam_params(beam_params)
+    r_poly = float(beam_params.get("r_poly_deg", 1.2))
+
+    g = _gaussian_only(x, A, sigma_deg)
+    proc = np.asarray(beam_params["poly_coeffs"], dtype=float).ravel()
+    if proc.size == 0:
+        p = np.zeros_like(x, dtype=float)
+    else:
+        p = np.polyval(proc[::-1], x)
+    p = np.clip(p, 0.0, np.inf)
+
+    return np.where(x <= r_poly, g, p)
+
+
+# Radial edge (deg) for [0, 1] beam normalization: 1 at r=0, 0 at this radius.
+_BEAM_NORM_R_MAX_DEG = 5.0
+
+
+def _beam_approx_endpoint_affine(
+    beam_params: dict[str, Any],
+    r_edge_deg: float = _BEAM_NORM_R_MAX_DEG,
+) -> tuple[float, float, float]:
+    """
+    Return ``(B(0), B(r_edge), B(0) - B(r_edge))`` from ``beam_approximation``.
+
+    Used to affine-map the fitted radial profile to 1 at the origin and 0 at
+    ``r_edge_deg`` (requires ``B(0) > B(r_edge)``).
+    """
+    r_edge_deg = float(r_edge_deg)
+    if r_edge_deg <= 0:
+        raise ValueError("r_edge_deg must be positive")
+    B0 = float(beam_approximation(np.array([0.0]), beam_params)[0])
+    Be = float(beam_approximation(np.array([r_edge_deg]), beam_params)[0])
+    denom = B0 - Be
+    if not np.isfinite(denom) or denom <= 0:
+        raise ValueError(
+            "Endpoint beam normalization requires beam_approximation(0°) > "
+            f"beam_approximation({r_edge_deg:g}°); got B(0)={B0}, B({r_edge_deg:g}°)={Be}."
+        )
+    return B0, Be, denom
+
+
+def _beam_approx_radial_endpoint_normalized(
+    radial_offset_deg: np.ndarray,
+    beam_params: dict[str, Any],
+    *,
+    r_edge_deg: float = _BEAM_NORM_R_MAX_DEG,
+    endpoint_affine: tuple[float, float, float] | None = None,
+) -> np.ndarray:
+    """
+    Scale ``beam_approximation`` to the ``[0, 1]`` interval with **W(0°)=1** and
+    **W(5°)=0** (default ``r_edge_deg``), matching the convolution kernel in
+    ``convolve_beam_with_fit``. Values are forced to 0 for ``r >= r_edge_deg``;
+    intermediate radii follow the fit, then values are clipped to ``[0, 1]``.
+
+    If ``endpoint_affine`` is given, it must be ``(B(0), B(r_edge), denom)``
+    from ``_beam_approx_endpoint_affine`` (avoids recomputing B at 0 and r_edge).
+    """
+    if endpoint_affine is None:
+        _, Be, denom = _beam_approx_endpoint_affine(beam_params, r_edge_deg)
+    else:
+        _, Be, denom = endpoint_affine
+    r = np.asarray(radial_offset_deg, dtype=float)
+    B = np.asarray(beam_approximation(r, beam_params), dtype=float)
+    W = (B - Be) / denom
+    W = np.where(r >= float(r_edge_deg), 0.0, W)
+    return np.clip(W, 0.0, 1.0)
+
+
+def plot_beam_approximation(
+    beam_params: dict[str, Any],
+    *,
+    x_max_deg: float = 5.0,
+    npts: int = 500,
+    normalize: bool = True,
+    show_components: bool = False,
+    r_poly_line: bool = True,
+    ax: Any = None,
+    show: bool = True,
+    title: str | None = "Piecewise beam approximation",
+) -> Any:
+    """
+    Plot ``beam_approximation`` vs radial offset (degrees).
+
+    Parameters
+    ----------
+    beam_params : dict
+        Same dictionary passed to ``beam_approximation`` / ``convolve_beam_with_fit``
+        (e.g. return value of ``fit_beam_gaussian``).
+    x_max_deg : float
+        Upper limit of the horizontal axis (deg); capped at 5° to match the
+        domain used for convolution.
+    npts : int
+        Number of samples along the radius.
+    normalize : bool
+        If True (default), scale the profile to ``[0, 1]`` with amplitude 1 at
+        0° and 0 at 5° (affine map of ``beam_approximation``, same rule as
+        ``convolve_beam_with_fit``).
+    show_components : bool
+        If True, also draw the full Gaussian and full polynomial (dotted) behind
+        the piecewise composite for comparison.
+    r_poly_line : bool
+        If True, mark ``r_poly_deg`` with a vertical line.
+    ax : matplotlib.axes.Axes or None
+        Axis to draw on; if ``None``, a new figure is created.
+    show : bool
+        If True, call ``plt.show()``.
+    title : str or None
+        Axes title; ``None`` to omit.
+
+    Returns
+    -------
+    matplotlib.axes.Axes
+    """
+    if x_max_deg <= 0:
+        raise ValueError("x_max_deg must be positive")
+    npts = int(max(2, npts))
+    x_hi = min(float(x_max_deg), _BEAM_NORM_R_MAX_DEG)
+    x = np.linspace(0.0, x_hi, npts)
+    r_poly = float(beam_params.get("r_poly_deg", 1.2))
+
+    if normalize:
+        affine = _beam_approx_endpoint_affine(beam_params, _BEAM_NORM_R_MAX_DEG)
+        _, B5, denom = affine
+        y = _beam_approx_radial_endpoint_normalized(
+            x, beam_params, endpoint_affine=affine
+        )
+    else:
+        y = np.asarray(beam_approximation(x, beam_params), dtype=float)
+        B5 = float("nan")
+        denom = float("nan")
+
+    if ax is None:
+        _, ax = plt.subplots(figsize=(7, 4))
+
+    if show_components:
+        A = float(beam_params["A"])
+        sigma_deg = _sigma_deg_from_beam_params(beam_params)
+        proc = np.asarray(beam_params["poly_coeffs"], dtype=float).ravel()
+        g_full = _gaussian_only(x, A, sigma_deg)
+        if proc.size == 0:
+            p_full = np.zeros_like(x, dtype=float)
+        else:
+            p_full = np.clip(np.polyval(proc[::-1], x), 0.0, np.inf)
+        if normalize:
+            g_full = np.clip((g_full - B5) / denom, 0.0, 1.0)
+            p_full = np.clip((p_full - B5) / denom, 0.0, 1.0)
+        ax.plot(x, g_full, ":", color="0.6", lw=1.2, alpha=0.85, label="Gaussian G(x)")
+        ax.plot(x, p_full, ":", color="0.4", lw=1.2, alpha=0.85, label="Polynomial P(x)")
+
+    ax.plot(
+        x,
+        y,
+        "b-",
+        lw=2,
+        label="Beam B(x)" if not normalize else r"$B(r)$: 1 at $0°$, 0 at $5°$",
+    )
+
+    if r_poly_line:
+        ax.axvline(r_poly, color="0.45", ls="--", lw=1.0, alpha=0.85, label=r"$r_\mathrm{poly}$")
+
+    ax.set_xlabel("Radial offset (deg)")
+    ax.set_ylabel("Normalized amplitude" if normalize else "Amplitude")
+    if title:
+        ax.set_title(title)
+    ax.legend(fontsize=8, loc="best")
+    ax.grid(alpha=0.3)
+    ax.set_xlim(0.0, x_hi)
+    if show:
+        plt.show()
+    return ax
+
+
+def _beam_approximation_beam_bl(
+    lmax: int,
+    beam_params: dict[str, Any],
+    *,
+    theta_max_deg: float,
+    ntheta: int,
+    normalize: bool = False,
+) -> np.ndarray:
+    """
+    Transfer function B_ell / B_0 from ``beam_approximation``, with ``B_0`` set to 1.
+
+    If ``normalize`` is True, the radial profile is affine-mapped so
+    ``beam_approximation`` has amplitude **1 at 0°** and **0 at 5°** (values in
+    ``[0, 1]``, same rule as ``plot_beam_approximation`` / ``convolve_beam_with_fit``).
+    If False, amplitudes from the fit are kept.
+    """
+    theta_rad = np.linspace(0.0, np.radians(float(theta_max_deg)), int(ntheta))
+    x_deg = np.degrees(theta_rad)
+
+    if normalize:
+        beam_prof = _beam_approx_radial_endpoint_normalized(
+            x_deg, beam_params, r_edge_deg=_BEAM_NORM_R_MAX_DEG
+        )
+    else:
+        beam_prof = beam_approximation(x_deg, beam_params)
+        beam_prof = np.clip(beam_prof, 0.0, np.inf)
+        peak = float(beam_prof[0])
+        if not np.isfinite(peak) or peak <= 0.0:
+            peak = float(np.nanmax(beam_prof))
+        if not np.isfinite(peak) or peak <= 0.0:
+            raise ValueError("Beam approximation has no positive peak; check the fit.")
+    bl = hp.beam2bl(beam_prof, theta_rad, int(lmax))
+    b0 = float(bl[0])
+    if not np.isfinite(b0) or b0 == 0.0:
+        raise ValueError(
+            "beam2bl produced invalid monopole; try increasing theta_max_deg or ntheta."
+        )
+    return bl / b0
+
+
+def fit_beam_gaussian(
     bin_centers: np.ndarray,
     mean_vals: np.ndarray,
     counts: np.ndarray | None = None,
     *,
-    baseline_k: float | None = None,
+    poly_order: int = 4,
+    knee_k: float = 120.0,
+    r_poly_deg: float = 1.2,
+    refine_joint: bool = False,
     ax: Any = None,
     show: bool = True,
     title: str = "Beam profile",
 ) -> dict[str, Any]:
     """
-    Fit a Gaussian bump to radial-offset bins vs mean (K), always relative to the
-    mean of ``mean_vals``: fit ``A*exp(-x**2/(2*sigma**2))`` to ``mean_k - mean(mean_k)``,
-    then plot ``bump + baseline``.
+    Piecewise fit: **Gaussian (core) and polynomial (outer)** in radial offset (deg).
+
+    Separate models (fitted independently on disjoint bin sets):
+
+        G(x) = A exp(-x²/(2σ²))
+        P(x) = Σ_k c_k x^k
+
+    **Fitting strategy**
+
+    1. **Gaussian** — ``curve_fit`` on bins with ``y > knee_k`` only. Then
+       **raise** ``A`` so the tallest data bin lies on or under the curve:
+       ``A ≥ yₘₐₓ / exp(-xₘₐₓ²/(2σ²))`` at the global argmax of ``y``.
+    2. **Polynomial** — bins with ``x > r_poly_deg``; ``polyfit`` directly on ``y``.
+
+    **FWHM vs half-power radius:** for an isolated on-axis Gaussian,
+    ``FWHM_deg = 2·√(2·ln 2)·σ ≈ 2.355·σ`` is the *full width* at half maximum.
+    The *radius* from the beam centre to the half-power point is
+    ``half_power_radius_deg = √(2·ln 2)·σ ≈ 1.18·σ`` (often what people read off a plot).
+
+    ``refine_joint`` is kept for backward compatibility but ignored because the
+    two fits are intentionally independent.
 
     Parameters
     ----------
-    baseline_k : float or None
-        If set, use this as the baseline instead of ``mean(mean_vals)``.
+    poly_order : int
+        Polynomial degree for the outer radial region. Must be >= 0.
+    knee_k : float
+        Core vs shoulder split in mean K; default 120 K.
+    r_poly_deg : float
+        Radial split (deg): polynomial uses **x > r_poly_deg**. Default 1.2°.
+    refine_joint : bool
+        If True, joint ``curve_fit`` from sequential ``p0``. Default False.
     """
+
     mask = np.isfinite(mean_vals) & np.isfinite(bin_centers)
     x = np.asarray(bin_centers[mask], dtype=float)
     y = np.asarray(mean_vals[mask], dtype=float)
 
-    if x.size < 5:
-        raise ValueError("Not enough valid data points to fit")
+    if poly_order < 0:
+        raise ValueError("poly_order must be >= 0")
+    if r_poly_deg <= 0:
+        raise ValueError("r_poly_deg must be positive")
+    if x.size < max(3, poly_order + 2):
+        raise ValueError(
+            f"Not enough valid data points ({x.size}) for poly_order={poly_order}"
+        )
 
     if counts is not None:
         c = np.asarray(counts[mask], dtype=float)
@@ -315,41 +607,147 @@ def plot_beam_gaussian(
 
     x_fit = np.linspace(0.0, float(np.max(x)), 500)
 
-    baseline = float(baseline_k) if baseline_k is not None else float(np.nanmean(y))
-    y_rel = y - baseline
-    A0 = float(np.nanmax(y_rel) - np.nanmin(y_rel))
-    if A0 <= 0:
-        A0 = float(np.nanmax(y_rel))
-    sigma0 = max(float(x[np.argmax(y_rel)]) / 2.0, 1e-3)
-    p0 = [A0, sigma0]
-    popt, pcov = curve_fit(
-        _gaussian_peak,
-        x,
-        y_rel,
-        p0=p0,
-        sigma=sigma_weights,
-        absolute_sigma=False,
-        maxfev=10000,
-    )
-    A, sigma = float(popt[0]), float(popt[1])
-    y_fit = _gaussian_peak(x_fit, A, sigma) + baseline
-    baseline_used = baseline
+    mask_core = y > knee_k
+    mask_poly = x > r_poly_deg
+    n_core = int(np.sum(mask_core))
+    n_poly = int(np.sum(mask_poly))
 
-    fwhm = 2.355 * sigma
+    # --- (1) First Gaussian: y > knee_k ---
+    x_c = x[mask_core]
+    y_c = y[mask_core]
+    if sigma_weights is not None:
+        sw_c = sigma_weights[mask_core]
+    else:
+        sw_c = None
+
+    if n_core >= 2:
+        A0 = float(max(np.nanmax(y_c), 1e-6))
+        i_pk = int(np.nanargmax(y_c))
+        sigma0 = max(float(x_c[i_pk]) / 2.0, 1e-4)
+        bounds_g = ([0.0, 1e-6], [np.inf, 180.0])
+        try:
+            (A, sigma), _ = curve_fit(
+                _gaussian_only,
+                x_c,
+                y_c,
+                p0=[A0, sigma0],
+                sigma=sw_c,
+                absolute_sigma=False,
+                bounds=bounds_g,
+                maxfev=20000,
+            )
+        except (RuntimeError, ValueError):
+            (A, sigma), _ = curve_fit(
+                _gaussian_only,
+                x_c,
+                y_c,
+                p0=[A0, sigma0],
+                sigma=sw_c,
+                absolute_sigma=False,
+                maxfev=20000,
+            )
+        A, sigma = float(A), float(sigma)
+        idx_max = int(np.nanargmax(y))
+        phi_pk = float(np.exp(-(float(x[idx_max]) ** 2) / (2.0 * sigma**2)))
+        A = max(A, float(y[idx_max]) / max(phi_pk, 1e-15))
+    else:
+        warnings.warn(
+            f"Fewer than 2 core points (y > {knee_k} K); fitting first Gaussian to full (x, y).",
+            UserWarning,
+            stacklevel=2,
+        )
+        A0 = float(max(np.nanmax(y), 1e-6))
+        i_pk = int(np.nanargmax(y))
+        sigma0 = max(float(x[i_pk]) / 2.0, 1e-4)
+        try:
+            (A, sigma), _ = curve_fit(
+                _gaussian_only,
+                x,
+                y,
+                p0=[A0, sigma0],
+                sigma=sigma_weights,
+                absolute_sigma=False,
+                bounds=([0.0, 1e-6], [np.inf, 180.0]),
+                maxfev=20000,
+            )
+        except (RuntimeError, ValueError):
+            (A, sigma), _ = curve_fit(
+                _gaussian_only,
+                x,
+                y,
+                p0=[A0, sigma0],
+                sigma=sigma_weights,
+                absolute_sigma=False,
+                maxfev=20000,
+            )
+        A, sigma = float(A), float(sigma)
+        idx_max = int(np.nanargmax(y))
+        phi_pk = float(np.exp(-(float(x[idx_max]) ** 2) / (2.0 * sigma**2)))
+        A = max(A, float(y[idx_max]) / max(phi_pk, 1e-15))
+
+    g1_x = _gaussian_only(x, A, sigma)
+
+    # --- (2) Polynomial: x > r_poly_deg only, fitted independently on y ---
+    if n_poly == 0:
+        p_high = np.zeros(poly_order + 1, dtype=float)
+        warnings.warn(
+            f"No bins with x > {r_poly_deg}°; polynomial coefficients set to zero.",
+            UserWarning,
+            stacklevel=2,
+        )
+    else:
+        x_p = x[mask_poly]
+        y_p = y[mask_poly]
+        eff_deg = min(poly_order, max(0, n_poly - 1))
+        if eff_deg < poly_order:
+            warnings.warn(
+                f"Only {n_poly} outer points (x > {r_poly_deg}°); "
+                f"fitting polynomial degree {eff_deg} (requested {poly_order}).",
+                UserWarning,
+                stacklevel=2,
+            )
+        if sigma_weights is not None:
+            w_p = 1.0 / np.maximum(sigma_weights[mask_poly], 1e-12) ** 2
+            p_high = np.polyfit(x_p, y_p, eff_deg, w=w_p)
+        else:
+            p_high = np.polyfit(x_p, y_p, eff_deg)
+        if eff_deg < poly_order:
+            p_high = np.concatenate(
+                [np.zeros(poly_order - eff_deg, dtype=float), p_high]
+            )
+
+    if refine_joint:
+        warnings.warn(
+            "refine_joint=True ignored: Gaussian and polynomial are fit independently.",
+            UserWarning,
+            stacklevel=2,
+        )
+
+    poly_coeffs = p_high[::-1].astype(float)
+
+    y_gauss = _gaussian_only(x_fit, A, sigma)
+    y_poly = np.polyval(poly_coeffs[::-1], x_fit)
+
+    sqrt_2_ln2 = np.sqrt(2.0 * np.log(2.0))
+    hpbw = float(sqrt_2_ln2 * sigma)
+    fwhm = float(2.0 * hpbw)
 
     if ax is None:
-        fig, ax = plt.subplots(figsize=(6, 4))
-    ax.scatter(x, y, s=10, label="Data (mean per pixel [K])")
+        fig, ax = plt.subplots(figsize=(7, 4))
+    ax.scatter(x, y, s=12, label="Data (mean K)", zorder=3)
+    ax.axvline(r_poly_deg, color="0.5", ls="-", lw=0.8, alpha=0.6)
     ax.plot(
         x_fit,
-        y_fit,
-        label=f"Gaussian fit \nσ={sigma:.3f}°, FWHM={fwhm:.3f}°",
+        y_gauss,
+        "--",
+        alpha=0.85,
+        label=f"Gaussian: σ={sigma:.3f}°, HPBW={hpbw:.3f}°, FWHM={fwhm:.3f}°",
     )
-    ax.axhline(baseline_used, color="gray", ls="--", lw=1, alpha=0.7, label="Baseline")
+    ax.plot(x_fit, y_poly, ":", alpha=0.85, label=f"Polynomial (deg {poly_order})")
     ax.set_xlabel("Radial offset (deg)")
     ax.set_ylabel("Mean (K)")
     ax.set_title(title)
-    ax.legend()
+    ax.legend(fontsize=8)
     ax.grid(alpha=0.3)
     if show:
         plt.show()
@@ -358,29 +756,52 @@ def plot_beam_gaussian(
         "A": A,
         "sigma_deg": sigma,
         "FWHM_deg": fwhm,
-        "baseline_K": baseline_used,
-        "covariance": pcov,
+        "half_power_radius_deg": hpbw,
+        "poly_coeffs": poly_coeffs,
+        "poly_order": poly_order,
+        "knee_k": knee_k,
+        "r_poly_deg": r_poly_deg,
+        "refine_joint": False,
+        "covariance": None,
+        "y_fit_gaussian": y_gauss,
+        "y_fit_polynomial": y_poly,
+        "x_fit": x_fit,
     }
 
 
-def convolve_beam_gaussian(
+def convolve_beam_with_fit(
     healmap: HealPixMap,
-    gaussian_params: dict[str, Any],
+    beam_params: dict[str, Any],
     *,
     attribute: str | None = None,
     mask_uncovered: bool = True,
+    normalize: bool = True,
+    theta_max_deg: float = 5.0,
+    lmax: int | None = None,
+    ntheta: int | None = None,
 ) -> HealPixMap:
     """
-    Smooth a healpix beam map with a Gaussian beam
-    Convolution is done with ``healpy.smoothing`` (Gaussian beam in harmonic
-    space, symmetric on the sphere).
+    Harmonic smoothing with a **single** composite beam from ``beam_approximation``:
+
+    - radial offset ``≤ r_poly_deg``: Gaussian (core),
+    - radial offset ``> r_poly_deg``: polynomial (outer).
+
+    The radial profile is turned into ``B_\\ell`` with ``healpy.beam2bl``; the
+    window is then scaled so ``B_0 = 1`` for ``healpy.smoothing``.
+    By default the radial beam is affine-mapped to **1 at 0°** and **0 at 5°**
+    (same ``[0, 1]`` rule as ``plot_beam_approximation``); set ``normalize=False``
+    to keep physical amplitudes from the fit.
+    Width for the Gaussian uses ``FWHM_deg`` (preferred), ``half_power_radius_deg``
+    (as FWHM in degrees), or ``sigma_deg``; ``σ = \\mathrm{FWHM} / (2\\sqrt{2\\ln 2})``.
 
     Parameters
     ----------
     healmap : HealPixMap
-        Map with channel(s) to smooth
-    gaussian_params : dict
-        Must include ``FWHM_deg`` and/or ``sigma_deg`` (from ``plot_beam_gaussian``).
+        Map with channel(s) to smooth.
+    beam_params : dict
+        Return value of ``fit_beam_gaussian``; must include ``A``, ``poly_coeffs``,
+        ``r_poly_deg``, and one of ``FWHM_deg``, ``half_power_radius_deg``, or
+        ``sigma_deg``.
     attribute : str or None
         Pol channel to smooth (e.g. ``\"AA_\"``). If ``None`` and there is
         exactly one entry in ``_channel_maps``, that channel is used; if there
@@ -388,6 +809,17 @@ def convolve_beam_gaussian(
     mask_uncovered : bool
         If True (default), pixels with no hits are set to ``UNSEEN`` before
         smoothing, then restored to 0 so they stay masked in ``plot``.
+    normalize : bool
+        If True (default), map ``beam_approximation`` to amplitude 1 at 0° and 0
+        at 5° (values clipped to ``[0, 1]``) before ``beam2bl``, matching
+        ``plot_beam_approximation``.
+    theta_max_deg : float
+        Upper limit (degrees) for discretizing the radial beam before ``beam2bl``.
+        Capped at 5° to match the plot; default 5°.
+    lmax : int or None
+        Multipole cutoff for the beam window. Default ``3 * nside - 1``.
+    ntheta : int or None
+        Number of radial samples for ``beam2bl``. Default ``max(512, 2 * (lmax + 1))``.
 
     Returns
     -------
@@ -396,14 +828,20 @@ def convolve_beam_gaussian(
         Use ``.plot(attribute=..., ra_dec_map=True, region=...)`` as with the
         original map.
     """
-    if "FWHM_deg" in gaussian_params:
-        fwhm_deg = float(gaussian_params["FWHM_deg"])
-    elif "sigma_deg" in gaussian_params:
-        fwhm_deg = 2.355 * float(gaussian_params["sigma_deg"])
-    else:
-        raise ValueError("gaussian_params must contain 'FWHM_deg' or 'sigma_deg'")
+    hp.check_max_nside(healmap.nside)
+    if lmax is None:
+        lmax = 3 * healmap.nside - 1
+    if ntheta is None:
+        ntheta = max(512, 2 * (lmax + 1))
 
-    fwhm_rad = np.radians(fwhm_deg)
+    theta_cap = min(float(theta_max_deg), 5.0)
+    beam_bl = _beam_approximation_beam_bl(
+        lmax,
+        beam_params,
+        theta_max_deg=theta_cap,
+        ntheta=ntheta,
+        normalize=normalize,
+    )
     hit = np.asarray(healmap.get_hit_count(), dtype=float)
 
     attrs: list[str]
@@ -434,7 +872,13 @@ def convolve_beam_gaussian(
         work = np.asarray(arr, dtype=float).copy()
         if mask_uncovered:
             work[hit <= 0] = hp.UNSEEN
-        sm = hp.smoothing(work, fwhm=fwhm_rad, verbose=False)
+        sm = hp.smoothing(
+            work,
+            beam_window=beam_bl,
+            pol=False,
+            lmax=lmax,
+            verbose=False,
+        )
         if mask_uncovered:
             sm = np.asarray(sm, dtype=float)
             sm[hit <= 0] = 0.0
