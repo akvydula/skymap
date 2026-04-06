@@ -10,7 +10,7 @@ import os
 import re
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Union
+from typing import Any, Literal, Union
 from astropy.io import fits
 import h5py
 import matplotlib.dates as mdates
@@ -317,6 +317,27 @@ def write_obs_hdf5(data: HDF5Data, file_path: str | Path) -> None:
 
 # Same polarization order as SpecData (used for cal gain/te per channel)
 CAL_POL_NAMES = ['AA_', 'BB_', 'CC_', 'DD_', 'AB_', 'BC_', 'CD_', 'AC_', 'BD_', 'AD_']
+
+
+def get_pol_source(data: object, *, kind: Literal["mean", "std"] = "mean") -> object | None:
+    """
+    Return the polarization summary container on a matched pointing dataset.
+
+    Expects output from `match_data_and_pointing`, which attaches:
+    - calibrated_spec_mean / calibrated_spec_std (preferred), OR
+    - spec_mean / spec_std (fallback)
+    """
+    if kind == "mean":
+        return getattr(data, "calibrated_spec_mean", None) or getattr(data, "spec_mean", None)
+    return getattr(data, "calibrated_spec_std", None) or getattr(data, "spec_std", None)
+
+
+def get_available_pol_names(data: object, *, kind: Literal["mean", "std"] = "mean") -> list[str]:
+    """Return pol channel names that exist and have data on the given object."""
+    source = get_pol_source(data, kind=kind)
+    if source is None:
+        return []
+    return [n for n in CAL_POL_NAMES if getattr(source, n, None) is not None]
 
 
 class PolChannels:
