@@ -25,6 +25,7 @@ classifiers = [
 
 dependencies = [
     "astropy>=7.0.0",
+    "radio-beam>=0.3.6",
     "numpy>=2.0.0",
     "healpy>=1.18.0",
     "matplotlib>=3.10.0",

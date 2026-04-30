@@ -11,11 +11,14 @@ import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal, Union
+from zoneinfo import ZoneInfo
 from astropy.io import fits
 import h5py
 import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
 import numpy as np
+from astropy import units as u
+from astropy.coordinates import AltAz, EarthLocation, SkyCoord
 from astropy.time import Time
 
 from skymap.utils import _time_to_mjd
@@ -393,21 +396,113 @@ def read_cal_hdf5(file_path: str | Path) -> CalData:
     return CalData(freq=freq, te=te_ch, gain=gain_ch)
 
 
-def get_slice_from_time(data: HDF5Data, time_slice: slice) -> HDF5Data:
+def _observation_bound_to_mjd_utc(
+    value: datetime | np.datetime64 | str | float,
+    tz: str | timezone | ZoneInfo | None,
+) -> float:
+    """Convert a wall-clock bound or MJD to UTC MJD (days) for time-axis matching."""
+    if isinstance(value, (float, np.floating, int, np.integer)):
+        v = float(value)
+        if 4e4 <= v < 7e5:
+            return v
+        raise ValueError(
+            f"Numeric observation bound must be MJD days in [40000, 700000), got {v!r}"
+        )
+
+    if isinstance(value, np.datetime64):
+        return float(Time(value).mjd)
+
+    if isinstance(value, str):
+        s = value.strip().replace("Z", "+00:00")
+        dt = datetime.fromisoformat(s)
+    elif isinstance(value, datetime):
+        dt = value
+    else:
+        return float(Time(value).utc.mjd)
+
+    if dt.tzinfo is None:
+        if tz is None:
+            raise ValueError(
+                "tz is required when start/end are naive datetimes or timezone-naive ISO strings"
+            )
+        zi = ZoneInfo(tz) if isinstance(tz, str) else tz
+        dt = dt.replace(tzinfo=zi)
+    return float(Time(dt).utc.mjd)
+
+
+def _slice_from_observation_times(
+    data: HDF5Data,
+    start: datetime | np.datetime64 | str | float,
+    end: datetime | np.datetime64 | str | float,
+    tz: str | timezone | ZoneInfo | None,
+) -> slice:
+    """Map observation [start, end) in the given timezone (for naive times) to a time index slice.
+
+    Notes
+    -----
+    This uses **end-exclusive** semantics to match normal Python slicing:
+    ``data.time[slice(i0, i1)]`` includes indices ``i0..i1-1``.
+    """
+    if len(data.time) == 0:
+        return slice(0, 0)
+    
+    times64 = np.asarray(data.time, dtype="datetime64[ns]")
+    start_dt = _mjd_utc_to_dt64ns(_observation_bound_to_mjd_utc(start, tz))
+    end_dt = _mjd_utc_to_dt64ns(_observation_bound_to_mjd_utc(end, tz))
+    if start_dt > end_dt:
+        raise ValueError(f"start {start_dt} must be <= end {end_dt} (UTC)")
+    i0 = int(np.searchsorted(times64, start_dt, side="left"))
+    i1 = int(np.searchsorted(times64, end_dt, side="left"))
+    return slice(i0, i1)
+
+
+def _mjd_utc_to_dt64ns(mjd: float) -> np.datetime64:
+    """Convert UTC MJD (days) to numpy datetime64[ns] (UTC)."""
+    dt = Time(mjd, format="mjd", scale="utc").to_datetime(timezone=timezone.utc)
+    # Store as UTC-naive datetime64 (we consistently treat stored datetimes as UTC).
+    return np.datetime64(dt.replace(tzinfo=None), "ns")
+
+
+def get_slice_from_time(
+    data: HDF5Data,
+    time_slice: slice | None = None,
+    *,
+    start: datetime | np.datetime64 | str | float | None = None,
+    end: datetime | np.datetime64 | str | float | None = None,
+    tz: str | timezone | ZoneInfo | None = None,
+) -> HDF5Data:
     """
     Get a slice of the data from the time slice. Slices time and all
     time-varying attributes (spec, calibrated_spec if present).
+
     Parameters
     ----------
     data : HDF5Data
         Input data.
-    time_slice : slice
+    time_slice : slice, optional
         Slice to apply along the time dimension (e.g. slice(0, 1000)).
+        Use this **or** ``start``/``end``, not both.
+    start, end : datetime, numpy.datetime64, str, or float, optional
+        Observation window in wall time when ``time_slice`` is omitted.
+        ``float`` values are interpreted as MJD (days, UTC). Strings use
+        :func:`datetime.fromisoformat` (append ``Z`` for UTC). For naive
+        datetimes or naive ISO strings, ``tz`` is required.
+    tz : str, datetime.timezone, or zoneinfo.ZoneInfo, optional
+        IANA zone name (e.g. ``\"America/New_York\"``) or timezone object.
+        Used only when ``start``/``end`` are naive wall times.
+
     Returns
     -------
     HDF5Data
         New HDF5Data with time, spec, and calibrated_spec (if present) sliced.
     """
+    if time_slice is not None and (start is not None or end is not None):
+        raise ValueError("Pass either time_slice or start/end, not both.")
+    if time_slice is None:
+        if start is None or end is None:
+            raise ValueError("Provide time_slice or both start and end.")
+        time_slice = _slice_from_observation_times(data, start, end, tz)
+
     # Slice time
     time_sliced = data.time[time_slice]
 
@@ -517,11 +612,6 @@ def find_pointing_files(
         raise FileNotFoundError(f"Data directory not found: {datadir}")
 
     # Normalize to naive UTC for comparison (file times are parsed as naive UTC)
-    def _to_utc_naive(dt: datetime) -> datetime:
-        if dt.tzinfo is not None:
-            return dt.astimezone(timezone.utc).replace(tzinfo=None)
-        return dt
-
     start_utc = _to_utc_naive(start_utc)
     end_utc = _to_utc_naive(end_utc)
     if start_utc > end_utc:
@@ -536,6 +626,159 @@ def find_pointing_files(
             pointing_files.append(str(path.resolve()))
 
     return sorted(pointing_files)  
+
+def _list_pointing_files_with_times(datadir: str | Path) -> list[tuple[datetime, Path]]:
+    """Return all pointing FITS files in datadir with parsed filename UTC time, sorted."""
+    datadir = Path(datadir)
+    items: list[tuple[datetime, Path]] = []
+    for path in datadir.glob("*.fits"):
+        t = _parse_pointing_filename_utc(path)
+        if t is None:
+            continue
+        items.append((t, path))
+    items.sort(key=lambda x: x[0])
+    return items
+
+
+def _to_utc_naive(dt: datetime) -> datetime:
+    """Normalize datetime to naive UTC (assume naive inputs are already UTC)."""
+    if dt.tzinfo is not None:
+        return dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt
+
+
+def _dt_utc_to_mjd(dt: datetime) -> float:
+    """Convert a (possibly tz-aware) datetime to UTC MJD days. Naive datetimes are treated as UTC."""
+    dt_utc = _to_utc_naive(dt).replace(tzinfo=timezone.utc)
+    return float(Time(dt_utc).mjd)
+
+
+_MAX_POINTING_SPILL_FILES = 12
+_POINTING_EL_OFFSET_DEG = 0.06945
+_POINTING_AZ_OFFSET_DEG = 0.01011
+
+
+def _utc_naive_floor_minute(dt: datetime) -> datetime:
+    """UTC-naive datetime truncated to the minute (for coarse spill heuristics)."""
+    d = _to_utc_naive(dt)
+    return d.replace(second=0, microsecond=0)
+
+
+def _antposgr_nrows(path: str | Path) -> int:
+    """Number of rows in ANTPOSGR without loading the table (fast empty check)."""
+    path = Path(path)
+    with fits.open(path, memmap=False) as hdul:
+        return int(hdul["ANTPOSGR"].header.get("NAXIS2", 0) or 0)
+
+
+def _select_pointing_paths_covering_window(
+    all_with_times: list[tuple[datetime, Path]],
+    start_utc: datetime,
+    end_utc: datetime,
+    *,
+    start_mjd: float,
+    end_mjd: float,
+    max_spill: int = _MAX_POINTING_SPILL_FILES,
+) -> tuple[list[str], dict[str, Any]]:
+    """
+    Choose FITS paths whose tabulated DMJD can cover [start_mjd, end_mjd].
+
+    Filename timestamps are chunk *starts*; samples can extend before the first in-window
+    filename (need older chunks, skipping empty tables) and can use the first chunk
+    *after* end_utc when its DMJD still falls inside the requested wall-time window.
+    """
+    meta: dict[str, Any] = {
+        "i_first": None,
+        "i_last": None,
+        "core": [],
+        "spill_start": [],
+        "spill_end": [],
+        "skipped_empty": [],
+    }
+    if not all_with_times:
+        return [], meta
+
+    file_dt64 = np.array(
+        [np.datetime64(_to_utc_naive(t), "s") for t, _ in all_with_times],
+        dtype="datetime64[s]",
+    )
+    start64 = np.datetime64(start_utc, "s")
+    end64 = np.datetime64(end_utc, "s")
+    n = len(all_with_times)
+    i_first = int(np.searchsorted(file_dt64, start64, side="left"))
+    i_last = int(np.searchsorted(file_dt64, end64, side="right")) - 1
+    meta["i_first"] = i_first
+    meta["i_last"] = i_last
+
+    lo = int(max(0, i_first))
+    hi = int(min(n - 1, i_last))
+    core: list[str] = []
+    if lo <= hi:
+        core = [str(all_with_times[i][1].resolve()) for i in range(lo, hi + 1)]
+    meta["core"] = [Path(p).name for p in core]
+
+    spill_start: list[str] = []
+    # If the requested start is already at or after the first core chunk's filename
+    # (same minute or later), older chunks cannot contribute without reopening an
+    # earlier scan — skip backward spill so we do not open empty predecessors
+    # (e.g. 17:49) when the user sets start to 18:04 and the first file is 18:04:07.
+    need_spill_before = True
+    if lo <= hi and lo < n:
+        first_core_name_t = _to_utc_naive(all_with_times[lo][0])
+        if _utc_naive_floor_minute(start_utc) >= _utc_naive_floor_minute(first_core_name_t):
+            need_spill_before = False
+            meta["spill_start_skipped"] = (
+                "start_utc is on or after the first core file's name (minute floor); "
+                "backward spill not needed"
+            )
+    if need_spill_before:
+        j = i_first - 1
+        hops = 0
+        while j >= 0 and hops < max_spill:
+            hops += 1
+            path = all_with_times[j][1]
+            if _antposgr_nrows(path) == 0:
+                meta["skipped_empty"].append(path.name)
+                j -= 1
+                continue
+            pd = read_pointing_fits(path)
+            d = np.asarray(pd.dmjd, dtype=float)
+            dmax, dmin = float(np.max(d)), float(np.min(d))
+            if dmax < start_mjd:
+                j -= 1
+                continue
+            spill_start.insert(0, str(path.resolve()))
+            if dmin <= start_mjd:
+                break
+            j -= 1
+
+    spill_end: list[str] = []
+    j = i_last + 1
+    hops = 0
+    while j < n and hops < max_spill:
+        hops += 1
+        path = all_with_times[j][1]
+        if _antposgr_nrows(path) == 0:
+            meta["skipped_empty"].append(path.name)
+            j += 1
+            continue
+        pd = read_pointing_fits(path)
+        d = np.asarray(pd.dmjd, dtype=float)
+        dmin, dmax = float(np.min(d)), float(np.max(d))
+        if dmin > end_mjd:
+            break
+        spill_end.append(str(path.resolve()))
+        if dmax >= end_mjd:
+            break
+        j += 1
+
+    meta["spill_start"] = [Path(p).name for p in spill_start]
+    meta["spill_end"] = [Path(p).name for p in spill_end]
+
+    combined = spill_start + core + spill_end
+    ordered = list(dict.fromkeys(combined))
+    return ordered, meta
+
 
 def read_pointing_files(pointing_files: list[str]) -> PointingData:
     """
@@ -553,6 +796,11 @@ def read_pointing_files(pointing_files: list[str]) -> PointingData:
     if not pointing_files:
         raise ValueError("pointing_files must not be empty")
     parts = [read_pointing_fits(f) for f in pointing_files]
+    parts = [p for p in parts if len(np.asarray(p.dmjd)) > 0]
+    if not parts:
+        raise ValueError(
+            "All pointing FITS had no ANTPOSGR rows (empty tables); nothing to concatenate"
+        )
     return PointingData(
         dmjd=np.concatenate([p.dmjd for p in parts]),
         az=np.concatenate([p.az for p in parts]),
@@ -561,7 +809,13 @@ def read_pointing_files(pointing_files: list[str]) -> PointingData:
         dec=np.concatenate([p.dec for p in parts]),
     )
 
-def get_pointing_data(datadir: str | Path, start_utc: datetime, end_utc: datetime) -> PointingData:
+def get_pointing_data(
+    datadir: str | Path,
+    start_utc: datetime,
+    end_utc: datetime,
+    *,
+    add_pointing_offset: bool = True,
+) -> PointingData:
     """
     Get pointing data for files within a UTC time range.
 
@@ -573,17 +827,80 @@ def get_pointing_data(datadir: str | Path, start_utc: datetime, end_utc: datetim
         Start of time range (UTC), inclusive.
     end_utc : datetime
         End of time range (UTC), inclusive.
+    add_pointing_offset : bool, optional
+        If True, apply fixed telescope pointing offsets to returned samples:
+        +0.06945 deg in elevation and +0.01011 deg in azimuth.
 
     Returns
     -------
     PointingData
         PointingData object combining all files in the range.
     """
-    pointing_files = find_pointing_files(datadir, start_utc, end_utc)
+    start_utc = _to_utc_naive(start_utc)
+    end_utc = _to_utc_naive(end_utc)
+    if start_utc > end_utc:
+        raise ValueError(f"start_utc must be <= end_utc, got {start_utc} and {end_utc}")
+
+    start_mjd = _dt_utc_to_mjd(start_utc)
+    end_mjd = _dt_utc_to_mjd(end_utc)
+    datadir = Path(datadir)
+    if not datadir.exists():
+        raise FileNotFoundError(f"Data directory not found: {datadir}")
+
+    all_with_times = _list_pointing_files_with_times(datadir)
+    pointing_files, sel_meta = _select_pointing_paths_covering_window(
+        all_with_times,
+        start_utc,
+        end_utc,
+        start_mjd=start_mjd,
+        end_mjd=end_mjd,
+    )
+
     if len(pointing_files) == 0:
         raise FileNotFoundError(f"No pointing files found in {datadir} between {start_utc} and {end_utc}")
-    print(f"Found {len(pointing_files)} pointing files between {start_utc} and {end_utc}")
-    return read_pointing_files(pointing_files)
+
+    n_core = len(sel_meta["core"])
+    n_sb = len(sel_meta["spill_start"])
+    n_se = len(sel_meta["spill_end"])
+    print(
+        f"Pointing: {len(pointing_files)} file(s) "
+        f"(core by filename={n_core}, spill_before={n_sb}, spill_after={n_se}) "
+        f"for {start_utc} .. {end_utc} UTC"
+    )
+    if sel_meta["skipped_empty"]:
+        uq = sorted(set(sel_meta["skipped_empty"]))
+        print(f"  Skipped {len(uq)} empty ANTPOSGR table(s): {', '.join(uq[:5])}" + (" ..." if len(uq) > 5 else ""))
+    if sel_meta["spill_start"]:
+        print(f"  spill_before: {sel_meta['spill_start']}")
+    if sel_meta["spill_end"]:
+        print(f"  spill_after: {sel_meta['spill_end']}")
+    if sel_meta.get("spill_start_skipped"):
+        print(f"  {sel_meta['spill_start_skipped']}")
+    pd = read_pointing_files(pointing_files)
+
+    # Trim to the requested time window using the actual sample timestamps.
+    dmjd = np.asarray(pd.dmjd, dtype=float)
+    mask = (dmjd >= start_mjd) & (dmjd <= end_mjd)
+    n_raw = int(len(dmjd))
+    n_keep = int(np.count_nonzero(mask))
+    print(f"  ANTPOSGR rows: {n_raw} combined -> {n_keep} with {start_mjd:.6f} <= DMJD <= {end_mjd:.6f}")
+    if not np.any(mask):
+        raise FileNotFoundError(
+            f"Pointing files were found, but no pointing samples fall within {start_utc}..{end_utc}."
+        )
+    az = np.asarray(pd.az[mask], dtype=float)
+    el = np.asarray(pd.el[mask], dtype=float)
+    if add_pointing_offset:
+        az = az + _POINTING_AZ_OFFSET_DEG
+        el = el + _POINTING_EL_OFFSET_DEG
+
+    return PointingData(
+        dmjd=pd.dmjd[mask],
+        az=az,
+        el=el,
+        ra=pd.ra[mask],
+        dec=pd.dec[mask],
+    )
 
 
 
@@ -708,6 +1025,135 @@ def match_data_and_pointing(
         az=np.asarray(pointing_data.az),
         **{mean_suffix: mean_spec, std_suffix: std_spec},
     )
+
+
+def _azimuth_offset_deg(measured_az_deg: float, reference_az_deg: float) -> float:
+    """Shortest signed difference in degrees (−180, 180]."""
+    d = float(measured_az_deg) - float(reference_az_deg)
+    return (d + 180.0) % 360.0 - 180.0
+
+
+def get_pointing_offset(
+    data_matched: HDF5Data,
+    source_name: str,
+    *,
+    observer_location: EarthLocation | None = None,
+) -> dict[str, float]:
+    """
+    Compute pointing offsets in **azimuth and elevation** (deg) for a cross (X) pattern.
+
+    Expects the *matched* output from :func:`match_data_and_pointing`, i.e. an object
+    with:
+    - ``ra``, ``dec``, ``az``, and ``el`` arrays (deg), one per pointing sample
+    - ``time`` aligned with those samples
+    - ``calibrated_spec_mean`` as a CalibratedSpec-like container where each
+      polarization is shape (n_pointing, n_freq)
+
+    The catalog position (RA/Dec) is transformed to Alt/Az at each sample time using
+    ``observer_location`` (default: Green Bank Telescope). Then:
+
+    - **az_offset**: at the maximum-response sample in the **first** half (same split as
+      :func:`skymap.plots.plot_freq_avg_vs_pointing`), measured az minus expected source az.
+    - **el_offset**: at the maximum-response sample in the **second** half, measured el minus
+      expected source elevation.
+
+    Azimuth difference is wrapped to (−180°, 180°]. For fewer than two samples, both offsets
+    use the single global maximum sample.
+    """
+    if getattr(data_matched, "ra", None) is None or getattr(data_matched, "dec", None) is None:
+        raise ValueError("data_matched must have ra and dec (output from match_data_and_pointing)")
+    if getattr(data_matched, "az", None) is None or getattr(data_matched, "el", None) is None:
+        raise ValueError(
+            "data_matched must have az and el to compute az/el offsets (output from match_data_and_pointing)"
+        )
+    mean_spec = getattr(data_matched, "calibrated_spec_mean", None)
+    if mean_spec is None:
+        raise ValueError(
+            "data_matched must have calibrated_spec_mean to compute pointing offset (run calibration + match_data_and_pointing)"
+        )
+
+    # Import locally to avoid pulling plotting/healpy deps on module import.
+    from skymap.Beam import get_source_radec
+
+    src_ra, src_dec = get_source_radec(source_name)
+
+    per_pol = []
+    for name in CAL_POL_NAMES:
+        arr = getattr(mean_spec, name, None)
+        if arr is None:
+            continue
+        arr = np.asarray(arr, dtype=float)
+        if arr.ndim != 2:
+            raise ValueError(f"calibrated_spec_mean.{name} must be 2D (n_pointing, n_freq), got {arr.shape}")
+        per_pol.append(np.nanmean(arr, axis=1))
+
+    if not per_pol:
+        raise ValueError("calibrated_spec_mean has no available polarization channels to average")
+
+    val = np.nanmean(np.vstack(per_pol), axis=0)  # (n_pointing,)
+    if val.size == 0:
+        raise ValueError("No pointing samples in data_matched")
+    if not np.any(np.isfinite(val)):
+        raise ValueError("Frequency-averaged calibrated_spec_mean is all-NaN; cannot determine peak pointing")
+
+    ra = np.asarray(data_matched.ra, dtype=float)
+    dec = np.asarray(data_matched.dec, dtype=float)
+    az = np.asarray(data_matched.az, dtype=float)
+    el = np.asarray(data_matched.el, dtype=float)
+    n = val.size
+    n_mid = n // 2
+
+    time_arr = np.asarray(data_matched.time)
+    if time_arr.shape[0] != n:
+        raise ValueError(
+            f"data_matched.time length ({time_arr.shape[0]}) must match number of pointing samples ({n})"
+        )
+    mjd = _time_to_mjd(time_arr)
+    obstime = Time(mjd, format="mjd", scale="utc")
+    location = observer_location if observer_location is not None else EarthLocation.of_site("Green Bank Telescope")
+    sc_src = SkyCoord(ra=float(src_ra) * u.deg, dec=float(src_dec) * u.deg, frame="icrs")
+    src_altaz = sc_src.transform_to(AltAz(obstime=obstime, location=location))
+    src_az = np.asarray(src_altaz.az.to_value(u.deg), dtype=float)
+    src_el = np.asarray(src_altaz.alt.to_value(u.deg), dtype=float)
+
+    if n < 2 or n_mid == 0:
+        i_peak = int(np.nanargmax(val))
+        peak_ra = float(ra[i_peak])
+        peak_dec = float(dec[i_peak])
+        return {
+            "src_ra": float(src_ra),
+            "src_dec": float(src_dec),
+            "peak_ra": peak_ra,
+            "peak_dec": peak_dec,
+            "peak_az": float(az[i_peak]),
+            "peak_el": float(el[i_peak]),
+            "src_az": float(src_az[i_peak]),
+            "src_el": float(src_el[i_peak]),
+            "az_offset": _azimuth_offset_deg(az[i_peak], src_az[i_peak]),
+            "el_offset": float(el[i_peak] - src_el[i_peak]),
+        }
+
+    i1 = int(np.nanargmax(val[:n_mid]))
+    i2 = n_mid + int(np.nanargmax(val[n_mid:]))
+    peak_ra_leg1 = float(ra[i1])
+    peak_dec_leg1 = float(dec[i1])
+    peak_ra_leg2 = float(ra[i2])
+    peak_dec_leg2 = float(dec[i2])
+
+    return {
+        "src_ra": float(src_ra),
+        "src_dec": float(src_dec),
+        "peak_ra": peak_ra_leg1,
+        "peak_dec": peak_dec_leg2,
+        "peak_ra_leg2": peak_ra_leg2,
+        "peak_dec_leg1": peak_dec_leg1,
+        "peak_az": float(az[i1]),
+        "peak_el": float(el[i2]),
+        "src_az": float(src_az[i1]),
+        "src_el": float(src_el[i2]),
+        "az_offset": _azimuth_offset_deg(az[i1], src_az[i1]),
+        "el_offset": float(el[i2] - src_el[i2]),
+    }
 
 
     '''
