@@ -61,6 +61,7 @@ def _to_jsonable(obj):
     return obj
 def save_beam_fit(beam_params: dict, path: Path | str) -> Path:
     """Save full input beam_params dict as JSON."""
+    path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as f:
         json.dump(_to_jsonable(beam_params), f, indent=2)
