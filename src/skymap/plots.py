@@ -2,7 +2,7 @@
 ploting utils functions
 '''
 
-from skymap.io import CalData, HDF5Data, CAL_POL_NAMES, PointingData
+from skymap.io import CalData, HDF5Data, CAL_POL_NAMES, PointingData, split_time_ordered_scans
 from skymap import io
 
 from pathlib import Path
@@ -15,7 +15,9 @@ from zoneinfo import ZoneInfo
 import matplotlib.dates as mdates
 import astropy.units as u
 from astropy.time import Time
-from typing import Literal
+from typing import Literal, Sequence
+
+from scipy.optimize import curve_fit
 
 
 def plot_cal_data(cal_data: CalData, attribute: str = 'gain', save_path: str | Path | None = None) -> None:
@@ -141,7 +143,7 @@ def get_plot_data(
             raise ValueError("No correlation data to plot (calibrated_spec may have no channels set)")
 
     if spec_attr in ("calibrated_spec_mean", "calibrated_spec_std"):
-        cbar_label = "Temperature (K) mean" if spec_attr.endswith("_mean") else "Temperature (K) std"
+        cbar_label = "Temperature (K) " if spec_attr.endswith("_mean") else "Temperature (K) std"
     elif spec_attr in ("spec_mean", "spec_std"):
         cbar_label = "Raw measurements mean" if spec_attr.endswith("_mean") else "Raw measurements std"
     else:
@@ -351,6 +353,8 @@ def _freq_avg_pointing_scatter_context(
     if pointing_data is None:
         if getattr(data, "ra", None) is None or getattr(data, "dec", None) is None:
             raise ValueError("Pointing (ra, dec, az, el) required; provide pointing_data or pre-matched data")
+        if AzEL_map and (getattr(data, "az", None) is None or getattr(data, "el", None) is None):
+            raise ValueError("Az/El pointing required when AzEL_map=True")
         ra = data.ra
         dec = data.dec
         az = data.az
@@ -361,6 +365,8 @@ def _freq_avg_pointing_scatter_context(
         dec = data.dec
         az = data.az
         el = data.el
+        if AzEL_map and (az is None or el is None):
+            raise ValueError("Matched pointing data must include az and el when AzEL_map=True")
 
     spec_mean = io.get_pol_source(data, kind="mean")
     spec_std = io.get_pol_source(data, kind="std")
@@ -392,7 +398,7 @@ def _freq_avg_pointing_scatter_context(
         x_label, y_label = "Azimuth (deg)", "Elevation (deg)"
     else:
         x_axis, y_axis = ra, dec
-        x_label, y_label = "RA (J2000)", "Dec (J2000)"
+        x_label, y_label = "RA (J2000) (deg)", "Dec (J2000) (deg)"
 
     pol_name = to_plot[0] if to_plot else list(plot_data.keys())[0]
     arr = plot_data[pol_name]
@@ -407,6 +413,7 @@ def _freq_avg_pointing_scatter_context(
         "x_label": x_label,
         "y_label": y_label,
         "arr_plot": arr_plot,
+        "time": time,
         "pol_name": pol_name,
         "value_label": value_label,
         "data_type": data_type,
@@ -429,6 +436,130 @@ def _scatter_sizes_from_values(z: np.ndarray, s_max: float, s_min_frac: float = 
     u = (z - lo) / span
     u = np.clip(np.where(finite, u, 0.0), 0.0, 1.0)
     return s_max * (s_min_frac + (1.0 - s_min_frac) * u)
+
+
+def gauss_with_baseline(x: np.ndarray, A: float, mu: float, sigma: float, b: float) -> np.ndarray:
+    return b + A * np.exp(-0.5 * ((x - mu) / sigma) ** 2)
+
+
+def fit_axis_beam(
+    x_scans: Sequence[np.ndarray],
+    y_scans: Sequence[np.ndarray],
+    *,
+    x_name: str = "x",
+    ax: plt.Axes | None = None,
+    labels: Sequence[str] | None = None,
+    colors: Sequence[str] | None = None,
+    alpha: float = 0.45,
+    marker_size: float = 14.0,
+) -> dict:
+    """
+    Overplot one or more scan legs, then fit a single Gaussian+baseline to all points.
+
+    Parameters
+    ----------
+    x_scans, y_scans : sequence of array-like
+        Coordinate and amplitude arrays for each scan leg (same length sequences).
+    x_name : str
+        Axis name for plot labels (e.g. ``"El"``, ``"Az"``, ``"RA"``, ``"Dec"``).
+    labels : sequence of str or None
+        Legend label per scan; defaults to ``Scan 1``, ``Scan 2``, ...
+    colors : sequence of str or None
+        Marker color per scan; defaults to ``C0``, ``C1``, ...
+    """
+    if len(x_scans) != len(y_scans):
+        raise ValueError("x_scans and y_scans must have the same length")
+    if len(x_scans) == 0:
+        raise ValueError("At least one scan is required")
+
+    xs_all = []
+    ys_all = []
+    for i, (xs, ys) in enumerate(zip(x_scans, y_scans)):
+        xs = np.asarray(xs, dtype=float)
+        ys = np.asarray(ys, dtype=float)
+        m = np.isfinite(xs) & np.isfinite(ys)
+        xs, ys = xs[m], ys[m]
+        if xs.size == 0:
+            continue
+        xs_all.append(xs)
+        ys_all.append(ys)
+
+    x = np.concatenate(xs_all)
+    y = np.concatenate(ys_all)
+    if x.size < 5:
+        raise ValueError(f"Not enough points to fit {x_name}")
+
+    b0 = np.nanpercentile(y, 20)
+    A0 = max(np.nanmax(y) - b0, 1e-6)
+    mu0 = x[np.nanargmax(y)]
+    sigma0 = max(np.nanstd(x) / 3.0, 1e-3)
+    p0 = [A0, mu0, sigma0, b0]
+    bounds = ([0.0, np.nanmin(x), 1e-6, -np.inf], [np.inf, np.nanmax(x), np.inf, np.inf])
+    popt, pcov = curve_fit(gauss_with_baseline, x, y, p0=p0, bounds=bounds, maxfev=20000)
+    A, mu, sigma, b = popt
+    fwhm = 2.0 * np.sqrt(2.0 * np.log(2.0)) * sigma
+
+    if ax is None:
+        _, ax = plt.subplots(figsize=(7, 4))
+
+    default_colors = [f"C{i}" for i in range(len(x_scans))]
+    use_colors = list(colors) if colors is not None else default_colors
+    use_labels = list(labels) if labels is not None else [f"Scan {i + 1}" for i in range(len(x_scans))]
+
+    for i, (xs, ys) in enumerate(zip(x_scans, y_scans)):
+        xs = np.asarray(xs, dtype=float)
+        ys = np.asarray(ys, dtype=float)
+        m = np.isfinite(xs) & np.isfinite(ys)
+        c = use_colors[i % len(use_colors)]
+        ax.scatter(xs[m], ys[m], s=marker_size, alpha=alpha, color=c, label=use_labels[i])
+
+    xx = np.linspace(np.nanmin(x), np.nanmax(x), 600)
+    yy = gauss_with_baseline(xx, *popt)
+    ax.plot(
+        xx,
+        yy,
+        "k-",
+        lw=2,
+        label=f"fit: mu={mu:.4f}, sigma={sigma:.4f}, FWHM={fwhm:.4f}",
+    )
+    ax.set_xlabel(f"{x_name} (deg)")
+    ax.set_ylabel("Amplitude")
+    ax.grid(alpha=0.3)
+    ax.legend(fontsize=8)
+
+    return {
+        "A": float(A),
+        "mu_deg": float(mu),
+        "sigma_deg": float(sigma),
+        "FWHM_deg": float(fwhm),
+        "baseline": float(b),
+        "covariance": pcov,
+    }
+
+
+def _plot_scan_leg(
+    ax: plt.Axes,
+    coord: np.ndarray,
+    amp: np.ndarray,
+    *,
+    plot: str,
+    size: float,
+    color: str,
+    alpha: float,
+    label: str | None,
+    sort_by_x: bool,
+) -> None:
+    coord = np.asarray(coord, dtype=float)
+    amp = np.asarray(amp, dtype=float)
+    if coord.size == 0:
+        return
+    if sort_by_x:
+        o = np.argsort(coord)
+        coord, amp = coord[o], amp[o]
+    if plot == "line":
+        ax.plot(coord, amp, color=color, alpha=alpha, linewidth=1.0, label=label)
+    else:
+        ax.scatter(coord, amp, s=size, c=color, alpha=alpha, edgecolors="none", label=label)
 
 
 def plot_waterfall_with_pointing(
@@ -623,8 +754,11 @@ def plot_freq_avg_vs_pointing(
     data_type: str = "mag",
     attribute: str | None = None,
     use_std: bool = False,
+    AzEL_map: bool = False,
     freq_avg: bool = True,
     sort_by_x: bool = True,
+    n_scans: int = 4,
+    n_el_scans: int = 2,
     plot: Literal["scatter", "line"] = "scatter",
     save_path: str | Path | None = None,
     size: float = 10.0,
@@ -632,31 +766,44 @@ def plot_freq_avg_vs_pointing(
     alpha: float = 0.9,
     clim: tuple[float, float] | None = None,
     sky_point_size: float | None = None,
+    colorbar_label: str | None = None,
     calibrators_path: Path | str | None = None,
 ) -> None:
     """
-    Cross-pattern pointing: RA/Dec on-sky path plus marginals for each scan leg.
+    Cross-pattern pointing: on-sky path plus marginals for each scan leg.
 
     Uses the same data path as :func:`plot_waterfall_with_pointing` (mean/std from
-    matching when present). Splits samples **in time order** into two halves: the
-    first half is treated as the scan used for the **RA** cut (amplitude vs RA),
-    the second half for the **DEC** cut (amplitude vs Dec). The main panel shows
-    the full track in RA/Dec, colored by frequency-averaged amplitude.
+    matching when present). Samples are split **in time order** into ``n_scans`` equal
+    legs (default 4). The first ``n_el_scans`` legs are elevation scans (overplotted on
+    the elevation/Dec marginal); the remaining legs are azimuth scans (overplotted on
+    the azimuth/RA marginal). All legs are shown on the main panel.
+
+    By default x/y are RA/Dec; set ``AzEL_map=True`` for azimuth and elevation.
 
     Parameters
     ----------
     source_name : str or None, optional
         Calibrator name in ``calibrators.dat``. When set, overlays the catalog
-        position (same lookup as :func:`skymap.io.get_pointing_offset`).
+        position (RA/Dec star, or expected Az/El track when ``AzEL_map=True``).
+    AzEL_map : bool, default=False
+        If True, use azimuth and elevation instead of RA and Dec.
+    n_scans : int, default=4
+        Number of equal time-ordered scan legs.
+    n_el_scans : int, default=2
+        How many of the first legs are elevation scans; the rest are azimuth scans.
     clim : tuple of float or None, optional
         ``(vmin, vmax)`` for the main-panel color scale; if None, autoscale.
     sky_point_size : float or None, optional
-        Marker size for the main RA/Dec scatter; defaults to ``size``.
+        Marker size for the main scatter panel; defaults to ``size``.
+    colorbar_label : str or None, optional
+        Label for the main-panel colorbar; defaults to ``ctx["value_label"]``.
     calibrators_path : path-like or None, optional
         Passed to :func:`skymap.Beam.get_source_radec` when ``source_name`` is set.
     """
     if plot not in ("scatter", "line"):
         raise ValueError("plot must be 'scatter' or 'line'")
+    if n_el_scans < 1 or n_el_scans >= n_scans:
+        raise ValueError(f"n_el_scans must be between 1 and {n_scans - 1}, got {n_el_scans}")
 
     ctx = _freq_avg_pointing_scatter_context(
         data,
@@ -665,73 +812,97 @@ def plot_freq_avg_vs_pointing(
         data_type,
         attribute,
         use_std,
-        AzEL_map=False,
-        freq_avg=freq_avg,
+        AzEL_map,
+        freq_avg,
     )
 
-    ra = np.asarray(ctx["x_axis"], dtype=float)
-    dec = np.asarray(ctx["y_axis"], dtype=float)
+    x = np.asarray(ctx["x_axis"], dtype=float)
+    y = np.asarray(ctx["y_axis"], dtype=float)
     amp = np.asarray(ctx["arr_plot"], dtype=float)
+    time = np.asarray(ctx["time"])
 
-    mask = np.isfinite(ra) & np.isfinite(dec) & np.isfinite(amp)
-    ra = ra[mask]
-    dec = dec[mask]
+    mask = np.isfinite(x) & np.isfinite(y) & np.isfinite(amp)
+    x = x[mask]
+    y = y[mask]
     amp = amp[mask]
-    if ra.size == 0:
-        raise ValueError("No finite RA/Dec/amplitude samples to plot")
+    time = time[mask]
+    if x.size == 0:
+        raise ValueError("No finite pointing/amplitude samples to plot")
 
-    n_mid = len(ra) // 2
-    ra_1, dec_1, amp_1 = ra[:n_mid], dec[:n_mid], amp[:n_mid]
-    ra_2, dec_2, amp_2 = ra[n_mid:], dec[n_mid:], amp[n_mid:]
+    scan_indices = split_time_ordered_scans(len(x), n_scans=n_scans)
+    el_indices = scan_indices[:n_el_scans]
+    az_indices = scan_indices[n_el_scans:]
+    n_el_end = int(el_indices[-1][-1]) + 1 if el_indices else 0
 
-    if sort_by_x:
-        if ra_1.size:
-            o = np.argsort(ra_1)
-            ra_1, dec_1, amp_1 = ra_1[o], dec_1[o], amp_1[o]
-        if ra_2.size:
-            o = np.argsort(dec_2)
-            ra_2, dec_2, amp_2 = ra_2[o], dec_2[o], amp_2[o]
+    el_marg_title = f"Amplitude vs {'El' if AzEL_map else 'Dec'}"
+    az_marg_title = f"Amplitude vs {'Az' if AzEL_map else 'RA'}"
+    scan_colors = [f"C{i}" for i in range(n_scans)]
+    sky_edgecolors = ["white", "lightgray", "black", "dimgray"]
 
-    spec_mean = ctx["spec_mean"]
-    stat_suffix = (
-        " (std)"
-        if (ctx["use_std"] and spec_mean is not None)
-        else (" (mean)" if (spec_mean is not None) else "")
-    )
-    title_core = f"{ctx['pol_name']}{stat_suffix}".strip()
-
-    src_ra = src_dec = None
+    src_el_ref = src_az_ref = None
+    src_az_line = src_el_line = None
     if source_name is not None:
         from skymap.Beam import get_source_radec
 
         src_ra, src_dec = get_source_radec(source_name, path=calibrators_path)
+        if AzEL_map:
+            src_az, src_el = io.expected_source_altaz_deg(src_ra, src_dec, time)
+            line_ok = np.isfinite(src_az) & np.isfinite(src_el)
+            if np.any(line_ok):
+                src_az_line = src_az[line_ok]
+                src_el_line = src_el[line_ok]
+            if n_el_end > 0:
+                i_el = int(np.nanargmax(amp[:n_el_end]))
+                src_el_ref = float(src_el[i_el])
+            if n_el_end < len(amp):
+                i_az = n_el_end + int(np.nanargmax(amp[n_el_end:]))
+                src_az_ref = float(src_az[i_az])
+        else:
+            src_el_ref = float(src_dec)
+            src_az_ref = float(src_ra)
 
     s_sky = float(size) if sky_point_size is None else float(sky_point_size)
     fig = plt.figure(figsize=(10, 8))
     gs = fig.add_gridspec(2, 2, height_ratios=[1.0, 2.2], hspace=0.28, wspace=0.3)
-    ax_amp_ra = fig.add_subplot(gs[0, 0])
-    ax_amp_dec = fig.add_subplot(gs[0, 1])
-    ax_radec = fig.add_subplot(gs[1, :])
+    ax_amp_el = fig.add_subplot(gs[0, 0])
+    ax_amp_az = fig.add_subplot(gs[0, 1])
+    ax_sky = fig.add_subplot(gs[1, :])
 
-    kw = dict(color=color, alpha=alpha)
-    if plot == "line":
-        if ra_1.size:
-            ax_amp_ra.plot(ra_1, amp_1, **kw, linewidth=1.0)
-        if ra_2.size:
-            ax_amp_dec.plot(dec_2, amp_2, **kw, linewidth=1.0)
-    else:
-        if ra_1.size:
-            ax_amp_ra.scatter(ra_1, amp_1, s=size, c=color, alpha=alpha, edgecolors="none")
-        if ra_2.size:
-            ax_amp_dec.scatter(dec_2, amp_2, s=size, c=color, alpha=alpha, edgecolors="none")
+    for i, idx in enumerate(el_indices):
+        _plot_scan_leg(
+            ax_amp_el,
+            y[idx],
+            amp[idx],
+            plot=plot,
+            size=size,
+            color=scan_colors[i],
+            alpha=alpha,
+            label=f"Scan {i + 1}",
+            sort_by_x=sort_by_x,
+        )
+    for j, idx in enumerate(az_indices):
+        scan_no = n_el_scans + j + 1
+        _plot_scan_leg(
+            ax_amp_az,
+            x[idx],
+            amp[idx],
+            plot=plot,
+            size=size,
+            color=scan_colors[n_el_scans + j],
+            alpha=alpha,
+            label=f"Scan {scan_no}",
+            sort_by_x=sort_by_x,
+        )
 
-    ax_amp_ra.set_xlabel("RA (J2000) (deg)")
-    ax_amp_ra.set_ylabel(ctx["value_label"])
-    ax_amp_ra.set_title("Amplitude vs RA")
+    ax_amp_el.set_xlabel(ctx["y_label"])
+    ax_amp_el.set_ylabel(ctx["value_label"])
+    ax_amp_el.set_title(el_marg_title)
+    ax_amp_el.legend(loc="best", fontsize=8)
 
-    ax_amp_dec.set_xlabel("Dec (J2000) (deg)")
-    ax_amp_dec.set_ylabel(ctx["value_label"])
-    ax_amp_dec.set_title("Amplitude vs Dec")
+    ax_amp_az.set_xlabel(ctx["x_label"])
+    ax_amp_az.set_ylabel(ctx["value_label"])
+    ax_amp_az.set_title(az_marg_title)
+    ax_amp_az.legend(loc="best", fontsize=8)
 
     if clim is not None:
         vmin, vmax = float(clim[0]), float(clim[1])
@@ -745,35 +916,33 @@ def plot_freq_avg_vs_pointing(
     sm = ScalarMappable(cmap=cmap, norm=norm)
     sm.set_array([])
 
-    if ra_1.size:
-        ax_radec.scatter(
-            ra_1,
-            dec_1,
-            c=amp_1,
+    for i, idx in enumerate(scan_indices):
+        ax_sky.scatter(
+            x[idx],
+            y[idx],
+            c=amp[idx],
             cmap=cmap,
             norm=norm,
             s=s_sky,
             alpha=alpha,
-            edgecolors="white",
+            edgecolors=sky_edgecolors[i % len(sky_edgecolors)],
             linewidths=0.35,
-            label="Scan 1",
+            label=f"Scan {i + 1}",
         )
-    if ra_2.size:
-        ax_radec.scatter(
-            ra_2,
-            dec_2,
-            c=amp_2,
-            cmap=cmap,
-            norm=norm,
-            s=s_sky,
-            alpha=alpha,
-            edgecolors="black",
-            linewidths=0.35,
-            label="Scan 2",
+    fig.colorbar(sm, ax=ax_sky, label=colorbar_label or ctx["value_label"])
+    if AzEL_map and src_az_line is not None:
+        ax_sky.plot(
+            src_az_line,
+            src_el_line,
+            color="red",
+            linestyle="--",
+            linewidth=1.0,
+            alpha=0.85,
+            zorder=4,
+            label=f"{source_name} (expected Az/El)",
         )
-    fig.colorbar(sm, ax=ax_radec, label=ctx["value_label"])
-    if src_ra is not None:
-        ax_radec.scatter(
+    elif not AzEL_map and source_name is not None:
+        ax_sky.scatter(
             [src_ra],
             [src_dec],
             marker="*",
@@ -782,20 +951,19 @@ def plot_freq_avg_vs_pointing(
             edgecolors="k",
             linewidths=0.4,
             zorder=5,
-            label=f"{source_name} (catalog)",
+            label=f"{source_name} (catalog RA/Dec)",
         )
-    h, lab = ax_radec.get_legend_handles_labels()
+    h, lab = ax_sky.get_legend_handles_labels()
     if lab:
-        ax_radec.legend(loc="best", fontsize=9)
-    ax_radec.set_xlabel("RA (J2000) (deg)")
-    ax_radec.set_ylabel("Dec (J2000) (deg)")
-    ax_radec.set_title(f"{title_core} — on-sky path")
+        ax_sky.legend(loc="best", fontsize=9)
+    ax_sky.set_xlabel(ctx["x_label"])
+    ax_sky.set_ylabel(ctx["y_label"])
 
-    if src_ra is not None:
-        ax_amp_ra.axvline(src_ra, color="red", linestyle="--", linewidth=1.0, alpha=0.85)
-        ax_amp_dec.axvline(src_dec, color="red", linestyle="--", linewidth=1.0, alpha=0.85)
+    if src_el_ref is not None:
+        ax_amp_el.axvline(src_el_ref, color="red", linestyle="--", linewidth=1.0, alpha=0.85)
+    if src_az_ref is not None:
+        ax_amp_az.axvline(src_az_ref, color="red", linestyle="--", linewidth=1.0, alpha=0.85)
 
-    fig.suptitle(title_core, fontsize=11, y=0.995)
     fig.tight_layout(rect=[0, 0, 1, 0.96])
     if save_path is not None:
         plt.savefig(save_path, dpi=150, bbox_inches="tight")

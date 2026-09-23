@@ -1,0 +1,57 @@
+#!/usr/bin/env python3
+"""Fail a commit if any staged file is larger than 15 MiB.
+
+Install for this clone (git config is not required):
+    cp .githooks/pre-commit .git/hooks/pre-commit && chmod +x .git/hooks/pre-commit
+"""
+from __future__ import annotations
+
+import subprocess
+import sys
+from pathlib import Path
+
+MAX_BYTES = 15 * 1024 * 1024
+
+
+def staged_paths() -> list[str]:
+    out = subprocess.check_output(
+        [
+            "git",
+            "diff",
+            "--cached",
+            "--name-only",
+            "--diff-filter=ACMR",
+            "-z",
+        ]
+    )
+    if not out:
+        return []
+    return [p.decode() for p in out.split(b"\0") if p]
+
+
+def main() -> int:
+    too_big: list[tuple[str, int]] = []
+    for rel in staged_paths():
+        path = Path(rel)
+        if not path.is_file():
+            continue
+        size = path.stat().st_size
+        if size > MAX_BYTES:
+            too_big.append((rel, size))
+    if not too_big:
+        return 0
+    print(
+        "Commit blocked: these staged files are larger than 15 MB:",
+        file=sys.stderr,
+    )
+    for rel, size in too_big:
+        print(f"  {rel}  ({size / (1024 * 1024):.2f} MB)", file=sys.stderr)
+    print(
+        "Unstage or shrink them before committing.",
+        file=sys.stderr,
+    )
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

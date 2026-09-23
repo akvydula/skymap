@@ -1,6 +1,19 @@
 # Data directory
 data_310/
 
+# Local notes
+notes_md/
+
+# CASA session logs (repo root) and pipeline logs
+*.log
+
+# CASA deconvolution products under outputs/
+outputs/casa_deconv*/
+
+# Legacy Haslam / full-sky map dumps
+skymaps/
+legacy_skymaps/
+
 # Python
 __pycache__/
 *.py[cod]

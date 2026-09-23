@@ -1,29 +1,28 @@
-# Core dependencies for skymap project
+# Core + dev + CASA dependencies for skymap
 #
-# Installation:
+# Core only (from pyproject.toml):
+#   pip install -e .
+#
+# Everything including tests and CASA deconvolution:
+#   pip install --extra-index-url https://go.nrao.edu/pypi -e ".[all]"
+#
+# Or install this file directly (includes CASA extra index below):
 #   pip install -r requirements.txt
-#   OR
-#   conda install --file requirements.txt
+#   pip install -e .
 
-# Astronomy and coordinate calculations
-# Used in: AltAzSim (telescope.py, scansession.py, coveragemap/), scripts/, tests/
 astropy>=7.0.0
-
-# Numerical computing
-# Used in: AltAzSim (all modules), scripts/, tests/
+radio-beam>=0.3.6
 numpy>=2.0.0
-
-# HEALPix sky map operations
 healpy>=1.18.0
-
-# Plotting and visualization
 matplotlib>=3.10.0
-
-# HDF5 file I/O
-# Used in: scripts/utils.py
 h5py>=3.10.0
-
-# Testing framework
-# Used in: tests/ (test_plot_sky_coverage_jan13_19.py, run_tests.py)
+scipy>=1.11.0
 pytest>=8.0.0
 
+# CASA modular packages for skymap.deconvolve
+# - casatasks: deconvolve task (installs casatools automatically)
+# - casadata: runtime data tables (required; not auto-installed with casatasks)
+# - casacore/python-casacore: NOT needed (bundled in casatools wheels)
+--extra-index-url https://go.nrao.edu/pypi
+casatasks>=6.6.0
+casadata

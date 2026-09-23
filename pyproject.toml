@@ -37,6 +37,18 @@ dependencies = [
 dev = [
     "pytest>=8.0.0",
 ]
+# Modular CASA 6 for skymap.deconvolve (casatools is pulled in by casatasks).
+# casadata must be installed explicitly. casacore/python-casacore is NOT needed.
+# Install: pip install --extra-index-url https://go.nrao.edu/pypi -e ".[casa]"
+casa = [
+    "casatasks>=6.6.0",
+    "casadata",
+]
+all = [
+    "pytest>=8.0.0",
+    "casatasks>=6.6.0",
+    "casadata",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]
