@@ -70,3 +70,6 @@ dmypy.json
 
 # pyre type checker
 .pyre/
+
+# Auto-ignored: files larger than 15 MB (pre-commit hook)
+figures/cal_uncal_beam.pdf

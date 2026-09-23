@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fail a commit if any staged file is larger than 15 MiB.
+"""Unstage files larger than 15 MiB, append them to .gitignore, and continue.
 
 Install for this clone (git config is not required):
     cp .githooks/pre-commit .git/hooks/pre-commit && chmod +x .git/hooks/pre-commit
@@ -11,6 +11,12 @@ import sys
 from pathlib import Path
 
 MAX_BYTES = 15 * 1024 * 1024
+GITIGNORE = Path(".gitignore")
+AUTO_HEADER = "# Auto-ignored: files larger than 15 MB (pre-commit hook)"
+
+
+def run(args: list[str], **kwargs) -> subprocess.CompletedProcess:
+    return subprocess.run(args, check=True, **kwargs)
 
 
 def staged_paths() -> list[str]:
@@ -29,9 +35,38 @@ def staged_paths() -> list[str]:
     return [p.decode() for p in out.split(b"\0") if p]
 
 
+def gitignore_entries() -> set[str]:
+    if not GITIGNORE.is_file():
+        return set()
+    return {
+        line.strip()
+        for line in GITIGNORE.read_text().splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    }
+
+
+def append_gitignore(paths: list[str]) -> None:
+    existing = gitignore_entries()
+    new = [p for p in paths if p not in existing]
+    if not new:
+        return
+    text = GITIGNORE.read_text() if GITIGNORE.is_file() else ""
+    if text and not text.endswith("\n"):
+        text += "\n"
+    if AUTO_HEADER not in text:
+        text += f"\n{AUTO_HEADER}\n"
+    elif not text.endswith("\n"):
+        text += "\n"
+    for p in new:
+        text += f"{p}\n"
+    GITIGNORE.write_text(text)
+
+
 def main() -> int:
     too_big: list[tuple[str, int]] = []
     for rel in staged_paths():
+        if rel == ".gitignore":
+            continue
         path = Path(rel)
         if not path.is_file():
             continue
@@ -40,17 +75,27 @@ def main() -> int:
             too_big.append((rel, size))
     if not too_big:
         return 0
-    print(
-        "Commit blocked: these staged files are larger than 15 MB:",
-        file=sys.stderr,
-    )
+
+    rels = [rel for rel, _ in too_big]
+    print("These staged files are larger than 15 MB; unstaging and adding to .gitignore:", file=sys.stderr)
     for rel, size in too_big:
         print(f"  {rel}  ({size / (1024 * 1024):.2f} MB)", file=sys.stderr)
-    print(
-        "Unstage or shrink them before committing.",
-        file=sys.stderr,
-    )
-    return 1
+
+    run(["git", "reset", "-q", "HEAD", "--", *rels])
+    append_gitignore(rels)
+    run(["git", "add", "--", str(GITIGNORE)])
+
+    remaining = [p for p in staged_paths() if p not in set(rels)]
+    if not remaining:
+        print(
+            "Nothing left to commit after removing large files. "
+            ".gitignore was updated; commit again to record the ignore rules.",
+            file=sys.stderr,
+        )
+        return 1
+
+    print("Continuing commit without the large files.", file=sys.stderr)
+    return 0
 
 
 if __name__ == "__main__":
