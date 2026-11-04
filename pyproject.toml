@@ -25,6 +25,7 @@ classifiers = [
 
 dependencies = [
     "astropy>=7.0.0",
+    "radio-beam>=0.3.6",
     "numpy>=2.0.0",
     "healpy>=1.18.0",
     "matplotlib>=3.10.0",
@@ -36,6 +37,26 @@ dependencies = [
 dev = [
     "pytest>=8.0.0",
 ]
+# Modular CASA 6 for skymap.deconvolve (casatools is pulled in by casatasks).
+# casadata must be installed explicitly. casacore/python-casacore is NOT needed.
+# Install: pip install --extra-index-url https://go.nrao.edu/pypi -e ".[casa]"
+casa = [
+    "casatasks>=6.6.0",
+    "casadata",
+]
+# Interactive quick-look dashboard (run: skymap-dashboard)
+dashboard = [
+    "streamlit>=1.52",
+]
+all = [
+    "pytest>=8.0.0",
+    "streamlit>=1.52",
+    "casatasks>=6.6.0",
+    "casadata",
+]
+
+[project.scripts]
+skymap-dashboard = "skymap.dashboard.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
