@@ -19,6 +19,9 @@ h5py>=3.10.0
 scipy>=1.11.0
 pytest>=8.0.0
 
+# Dashboard (skymap-dashboard); also: pip install -e ".[dashboard]"
+streamlit>=1.52
+
 # CASA modular packages for skymap.deconvolve
 # - casatasks: deconvolve task (installs casatools automatically)
 # - casadata: runtime data tables (required; not auto-installed with casatasks)

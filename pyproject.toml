@@ -44,11 +44,19 @@ casa = [
     "casatasks>=6.6.0",
     "casadata",
 ]
+# Interactive quick-look dashboard (run: skymap-dashboard)
+dashboard = [
+    "streamlit>=1.52",
+]
 all = [
     "pytest>=8.0.0",
+    "streamlit>=1.52",
     "casatasks>=6.6.0",
     "casadata",
 ]
+
+[project.scripts]
+skymap-dashboard = "skymap.dashboard.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

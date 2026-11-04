@@ -10,6 +10,49 @@ This package is a collection of tools for the analysis and visualization of radi
 | `commission_jan_2026.ipynb` | Commissioning: load and explore GBT beam-scan HDF5 data. |
 | `pointing_data_tests.ipynb` | Pointing data I/O, FITS, match with spec, HealPix maps, beam radial offsets / fit, and RA/Dec plots. |
 
+## Dashboard (`src/skymap/dashboard/`)
+
+A Streamlit quick-look dashboard for beam-scan observations. It reuses the `skymap` package for all analysis and
+only reads the time windows you select, so multi-GB spectrometer files stay usable.
+
+```bash
+conda activate skymap
+pip install -e ".[dashboard]"        # once (adds streamlit and the `skymap-dashboard` command)
+skymap-dashboard                     # run from the folder containing data_310/
+```
+
+Options: `--data-root PATH` (or env `SKYMAP_DATA_ROOT`), `--port N`, `--no-browser`; anything else is passed to
+`streamlit run`. `python -m skymap.dashboard` is equivalent.
+
+**Data layout.** Sessions are folders under `data_310/` named like `TGBT25B_614_01` (any `<PROJECT>_<NNN>_<NN>`, e.g.
+`..._614_02`), containing `310/` (`cal_file_*.hdf5`, `GBTOBS_*.hdf5`) and `Antenna/` (pointing FITS,
+`YYYY_MM_DD_HH:MM:SS.fits`). The data root can be changed in the sidebar.
+
+**Trying it on "new" data.** `python -m skymap.dashboard.make_test_data` builds a synthetic session
+`data_310/TGBT25B_614_99` from `TGBT25B_614_01` with `spec -> 1.2 * spec + c` (options `--scale`, `--offset-frac`,
+`--offset`, `--files`, `--session`, `--force`); timestamps, calibration and pointing are copied unchanged.
+
+**Sidebar.** Dropdowns for session, calibration file, pointing directory, receiver (spectrometer) HDF5 file and
+cross-correlation (`AA*` ... `AD*` or `ALL`); source; display time zone. Two time windows are opened from the chosen
+file, either by a time slider, typed start/end times, or sample indices: the *peak-scan window* (source cut used for
+single/multi-scan and offset views) and the *beam-map window* (HEALPix and beam fit). Window size and an estimated
+memory use are shown, with a guard for very large windows.
+
+**Views.** Calibration (gain/Te, raw vs calibrated waterfall), Single scan (waterfall, amplitude vs time, pointing,
+RA/Dec track), Peak scans (2-4 az/el legs with Dec/RA Gaussian fits), Pointing & timing offsets, HEALPix (RA/Dec
+patch, full sky, gnomview), Beam fit (Gaussian beam fit, save/load JSON in `outputs/`). Defaults reproduce the Jan-16
+test observation (`TGBT25B_614_01`, 3C353, AB*).
+
+| File | Description |
+|------|-------------|
+| `src/skymap/dashboard/app.py` | Streamlit UI (sidebar + views). |
+| `src/skymap/dashboard/cli.py` | `skymap-dashboard` launcher. |
+| `src/skymap/dashboard/make_test_data.py` | Build a synthetic scaled session for testing. |
+| `src/skymap/dashboard/discovery.py` | Find sessions, calibration/spectrometer files and pointing directories. |
+| `src/skymap/dashboard/loaders.py` | Time-axis peek, wall-time to slice, correlation-selective windowed HDF5 read, calibration, pointing window. |
+| `src/skymap/dashboard/analysis.py` | Wrappers around `skymap.io` / `Beam` / `HealPixMap` (matching, offsets, timing, HEALPix, beam fit). |
+| `src/skymap/dashboard/figures.py` | Matplotlib capture of `skymap` plots and the dashboard-specific figures. |
+
 ## Source (`src/skymap/`)
 
 | File | Description |
